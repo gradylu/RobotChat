@@ -1,0 +1,15 @@
+# 唤醒词训练专用依赖（design §1.1 白名单外的 torch 只允许装进独立训练环境）
+#
+# 安装（仓库根目录）：
+#   python -m venv .venv-train
+#   .venv-train\Scripts\python.exe -m pip install -r tools/wakeword/requirements-train.txt
+#
+# 也可直接执行 tools/wakeword/run_train.ps1，脚本会自动建环境并安装。
+torch>=2.2
+numpy>=1.24
+pyyaml>=6.0
+onnxruntime>=1.17
+onnx>=1.15
+# 训练收尾要用运行时后端（robotchat.providers.kws.oww_onnx）复验，按需带上其轻量依赖
+structlog>=24.1
+httpx>=0.27

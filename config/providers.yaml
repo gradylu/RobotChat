@@ -1,0 +1,126 @@
+# 模型厂商驱动配置模板（改配置即可换厂商，FR-10）
+# 密钥只写「来源环境变量名」，真实密钥由部署环境注入（FR-10.10）
+
+providers:
+  asr:
+    active: funasr_local          # 热切换入口
+    primary: funasr_local
+    fallback: dashscope_stream
+    drivers:
+      funasr_local:
+        cloud: false
+        endpoint: "http://127.0.0.1:10095"   # 独立 FunASR 服务
+        sample_rate: 16000
+        mode: "2pass"
+        languages: [zh, en]                  # 能力协商：不支持方言（T-2A.1）
+        hotwords: ["充电桩", "A点", "会议室"]
+      dashscope_stream:
+        cloud: true
+        model: "paraformer-realtime-v2"
+        api_key_env: "DASHSCOPE_API_KEY"
+        languages: [zh, en, yue]             # 云端声明支持粤语
+        language_hints: [zh]
+      funasr_dialect:                        # 外置方言模型（T-2A.3，不进镜像）
+        cloud: false
+        languages: [dongbei, wuhan, shanghai, tianjin]
+        endpoints:
+          dongbei: "http://127.0.0.1:10096"
+          wuhan: "http://127.0.0.1:10097"
+          shanghai: "http://127.0.0.1:10098"
+          tianjin: "http://127.0.0.1:10099"
+        sample_rate: 16000
+        mode: "2pass"
+        hotwords: ["充电桩", "A点"]
+
+  llm:
+    active: edge_llm
+    primary: edge_llm
+    fallback: openai_cloud
+    drivers:
+      edge_llm:
+        base_url: "${LLM_BASE_URL}"
+        model: "${LLM_MODEL}"
+        stream: true
+        supports_tools: true
+        allow_local_llm: false     # true 仅用于拓扑 2（本机 LLM），须通过资源校验
+        timeout_ms: {connect: 300, first_token: 800, total: 30000}
+      openai_cloud:
+        cloud: true
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        model: "qwen-plus"
+        api_key_env: "DASHSCOPE_API_KEY"
+        timeout_ms: {connect: 500, first_token: 800, total: 60000}
+
+  knowledge:
+    active: http_rag               # http_rag | none
+    drivers:
+      http_rag:
+        base_url: "${KB_BASE_URL}"  # 留空 = 关闭知识库增强（启动 WARN 不阻断）
+        top_k: 4
+        max_chars: 1200
+        timeout_ms: 200
+        api_key_env: "KB_API_KEY"
+
+  tts:
+    active: qwen3_tts_local
+    primary: qwen3_tts_local
+    fallback: dashscope_tts
+    drivers:
+      qwen3_tts_local:
+        cloud: false
+        base_url: "http://127.0.0.1:8091"
+        voice: "default"
+        sample_rate: 16000
+        languages: [zh, en]                  # 无方言音色 → 普通话音色 + 降级标记（FR-15.14）
+      dashscope_tts:
+        cloud: true
+        model: "cosyvoice-v1"
+        api_key_env: "DASHSCOPE_API_KEY"
+        languages: [zh, yue, en]
+
+  wakeword:
+    enabled: true                  # false → 启动即 ACTIVE_IDLE，常开聆听（FR-14.8）
+    active: openwakeword
+    active_window_ms: 60000
+    preopen_asr: true
+    confirm_twice: false
+    drivers:
+      openwakeword:
+        # 三段式前端（onnxruntime 直连，免装 openwakeword 包；deployment §2）
+        melspec_model_path: "assets/wakeword/melspectrogram.onnx"
+        embedding_model_path: "assets/wakeword/embedding_model.onnx"
+        model_paths:
+          # 英文预训练模型（已入库，可直接验证唤醒链路）
+          - "assets/wakeword/hey_jarvis_v0.1.onnx"
+          # 中文定制模型：需用 openWakeWord 训练后替换（缺失时自检第 13 项 WARN）
+          - "assets/wakeword/wake_robot_v1.onnx"
+        # 顺序与 model_paths 对齐：模型 stem 未命中时按索引映射播报文案
+        wake_phrases: ["hey jarvis", "你好机器人"]
+        threshold: 0.6
+        cooldown_ms: 2000
+        sample_rate: 16000
+        frame_ms: 80
+    standby:
+      announce: false              # 待机态任务结果播报；半双工、不支持 Barge-in（FR-14.16）
+      announce_beep: true
+    open_ear:
+      cloud_asr_ack: false         # 常开聆听默认本地 ASR；改用云端须显式置 true
+    feedback:
+      mode: "tts"
+      text: "我在"
+      beep_path: "assets/sfx/wake.wav"
+
+resilience:
+  # 熔断（T-2.6，design §7.5）：失败计数窗口内达阈值 → OPEN；冷却期满 → HALF_OPEN 单探测 → 成功回切
+  failure_threshold: 5
+  failure_window_seconds: 30
+  cooldown_seconds: 30
+  health_probe_interval: 30
+  half_open_probe_timeout_ms: 2000
+  # 预热（T-2.7，ADR-04）：启动即探活主备驱动，规避模型冷启动
+  warmup_on_start: true
+  warmup_timeout_ms: 5000
+  # 离线检测（T-2.10）：公网不可达时锁定 cloud=true 的驱动，只用本地驱动
+  offline_probe_on_start: true
+  offline_probe_url: "https://dashscope.aliyuncs.com"
+  offline_probe_timeout_ms: 1500

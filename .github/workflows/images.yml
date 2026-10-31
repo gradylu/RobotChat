@@ -1,0 +1,55 @@
+# 双发行版镜像构建（T-7.1 / CON-10 / R21）
+#
+# - humble / jazzy 两条矩阵并行构建，各自产出 <version>-<distro> 标签；
+# - 构建后校验：运行用户非 root、镜像体积 ≤ 1.6 GB（C-111 / C-114 / C-115）；
+# - ARM64 本体建议在机器人上原生构建（deployment §3.5），CI 使用 amd64 保证可重复性。
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - deploy/**
+      - src/**
+      - config/**
+      - assets/**
+      - pyproject.toml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [humble, jazzy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 构建应用镜像
+        run: |
+          docker build \
+            -f deploy/Dockerfile \
+            --build-arg ROS_DISTRO=${{ matrix.ros_distro }} \
+            --build-arg GIT_SHA=${GITHUB_SHA::7} \
+            -t robotchat:ci-${{ matrix.ros_distro }} .
+
+      - name: 校验非 root 运行
+        run: |
+          user=$(docker run --rm --entrypoint whoami robotchat:ci-${{ matrix.ros_distro }})
+          test "$user" = "robotchat" || (echo "容器运行用户为 $user，期望 robotchat" && exit 1)
+
+      - name: 校验镜像体积
+        run: python deploy/scripts/check_deps.py --image robotchat:ci-${{ matrix.ros_distro }}
+
+      - name: 校验镜像内发行版标签一致
+        run: |
+          distro=$(docker run --rm --entrypoint printenv \
+            robotchat:ci-${{ matrix.ros_distro }} ROBOTCHAT_IMAGE_DISTRO)
+          test "$distro" = "${{ matrix.ros_distro }}"

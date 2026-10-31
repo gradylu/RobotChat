@@ -1,0 +1,72 @@
+# RobotChat 单机编排（design §5.1、deployment §5.1）
+# <distro> 由宿主机 ROS_DISTRO（humble / jazzy）决定（CON-10）
+
+x-ros2-env: &ros2-env
+  ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+  CYCLONEDDS_URI: file:///etc/cyclonedds/cyclonedds.xml
+
+services:
+  robotchat:
+    image: robotchat:${ROBOTCHAT_VERSION:-0.1.0}-${ROS_DISTRO:?set ROS_DISTRO to humble or jazzy}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:?set ROS_DISTRO to humble or jazzy}
+    container_name: robotchat
+    restart: unless-stopped
+    network_mode: host          # 与宿主机 ROS2 共享 DDS 网络，必须
+    ipc: host                   # 共享内存，DDS 大消息传输需要
+    init: true                  # 转发信号并回收僵尸进程，保证优雅停机
+    stop_grace_period: 20s      # 给当前轮次与落库留出收尾时间（T-3.10）
+    environment:
+      <<: *ros2-env
+      TZ: ${TZ:-Asia/Shanghai}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      KB_API_KEY: ${KB_API_KEY:-}
+      ROBOTCHAT_CONFIG_DIR: /app/config
+      ROBOTCHAT_DATA_DIR: /var/lib/robotchat
+      ROBOTCHAT_LOG_DIR: /var/log/robotchat
+      ROBOTCHAT_LOG_RETENTION_DAYS: ${ROBOTCHAT_LOG_RETENTION_DAYS:-14}
+      ROBOTCHAT_ENV: ${ROBOTCHAT_ENV:-robot}
+      # 线程数限制（T-7.3 / C-127）：与 cgroup CPU 上限匹配，避免线程风暴
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      MKL_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      NUMEXPR_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      # 部署层用简名 ROBOTCHAT_DEVICE_PROFILE，容器内映射为配置路径（FR-16.3）
+      ROBOTCHAT__AUDIO__DEVICE_PROFILE: ${ROBOTCHAT_DEVICE_PROFILE:-generic_ros_audio}
+    volumes:
+      - ../config:/app/config:ro                                      # 配置 + 机型 Profile 外置只读
+      - ./cyclonedds.xml:/etc/cyclonedds/cyclonedds.xml:ro            # DDS 配置
+      - robotchat-data:/var/lib/robotchat                             # SQLite / 记忆数据
+      - robotchat-logs:/var/log/robotchat                             # 日志
+      - /dev/shm:/dev/shm                                             # DDS 共享内存
+    tmpfs:
+      - /tmp:size=64m,mode=1777                                       # 非 root 运行时的临时目录
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 800M}
+        reservations: {memory: 300M}
+    healthcheck:
+      # 就绪探测（T-7.6 / C-124）：/api/ready 就绪前返回 503，故用异常判定
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/api/ready',timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "5"}
+
+volumes:
+  robotchat-data:
+  robotchat-logs:

@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-train/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+htmlcov/
+
+# WebUI
+webui/node_modules/
+
+# 配置与密钥不入版本库
+deploy/.env
+deploy/.upgrade-state
+deploy/backups/
+config/*.local.yaml
+config/app.*.local.yaml
+
+# 数据与日志
+var/
+logs/
+*.sqlite
+*.sqlite3
+
+# 虚拟机器人落盘的 TTS 音频
+deploy/sim-output/

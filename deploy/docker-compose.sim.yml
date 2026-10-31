@@ -1,0 +1,127 @@
+# 虚拟机器人仿真栈（无硬件时用 Docker 跑通语音链路）
+#
+#   docker compose -f deploy/docker-compose.sim.yml up -d --build
+#   docker compose -f deploy/docker-compose.sim.yml logs -f robot
+#   docker compose -f deploy/docker-compose.sim.yml down
+#
+# 与 deploy/docker-compose.yml 的区别：
+# - 不用 network_mode: host（Windows Docker Desktop 上不等于宿主机网络）；
+#   两个容器放入同一 bridge 网络，用 DDS 组播互相发现；
+# - RMW 用 ros-base 自带的 rmw_fastrtps_cpp：ros:<distro>-ros-base 不含 CycloneDDS，
+#   生产镜像需先安装 ros-<distro>-rmw-cyclonedds-cpp 才能用 cyclonedds.xml；
+# - 应用改用 sim_virtual_audio 机型 Profile（std_msgs 字节流），无需 audio_common_msgs；
+# - robot 容器回放 WAV 当麦克风，并把 TTS 落盘到 deploy/sim-output/。
+#
+# 依赖的模型服务（ASR / TTS）不在本栈内：
+# - 本机起 deploy/docker-compose.models.yml 时，把应用侧 base_url 指到
+#   http://host.docker.internal:10095 / :8091（或把模型服务并入本网络并按服务名访问）；
+# - 直接用云端：在 deploy/.env 里给 DASHSCOPE_API_KEY，并设
+#   ROBOTCHAT__PROVIDERS__ASR__ACTIVE=dashscope_stream
+#   ROBOTCHAT__PROVIDERS__TTS__ACTIVE=dashscope_tts
+#
+# 输入 WAV：默认挂载 var/sim/audio，文件 demo.wav（16 kHz / 单声道 / 16bit）。
+# 没有该文件时 robot 只发静音帧，仍可用于验证 DDS 链路与时延。
+
+name: robotchat-sim
+
+x-ros2-env: &ros2-env
+  ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+  ROS_DISTRO: ${ROS_DISTRO:-humble}
+
+services:
+  robot:
+    image: ros:${ROS_DISTRO:-humble}-ros-base
+    container_name: robotchat-sim-robot
+    init: true
+    restart: unless-stopped
+    environment:
+      <<: *ros2-env
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ../tools/sim:/sim:ro                        # 假机器人节点脚本
+      - ../var/sim/audio:/sim-audio:ro              # 回放用 WAV
+      - ./sim-output:/out                           # TTS 落盘
+    command:
+      - python3
+      - /sim/fake_robot.py
+      - --input
+      - ${SIM_INPUT_WAV:-/sim-audio/demo.wav}
+      - --out-dir
+      - /out
+      - --repeat
+      - "${SIM_REPEAT:-0}"
+    networks: [sim]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+
+  robotchat:
+    image: robotchat:${ROBOTCHAT_VERSION:-0.1.0}-${ROS_DISTRO:-humble}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:-humble}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: robotchat-sim-app
+    init: true
+    stop_grace_period: 20s
+    depends_on: [robot]
+    ports:
+      - "8080:8080"                                 # bridge 网络下显式映射 WebUI / API
+    environment:
+      <<: *ros2-env
+      TZ: ${TZ:-Asia/Shanghai}
+      ROBOTCHAT_ENV: sim
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      KB_API_KEY: ${KB_API_KEY:-}
+      ROBOTCHAT_CONFIG_DIR: /app/config
+      ROBOTCHAT_DATA_DIR: /var/lib/robotchat
+      ROBOTCHAT_LOG_DIR: /var/log/robotchat
+      # 仿真专用：原生 DDS + 虚拟机型 Profile；假机器人没有回声参考，关掉 AEC
+      ROBOTCHAT__AUDIO__TRANSPORT: ros2_native
+      ROBOTCHAT__AUDIO__DEVICE_PROFILE: sim_virtual_audio
+      ROBOTCHAT__AUDIO__AEC__MODE: none
+      # 中文唤醒词模型还没训练好时退化为常开聆听，直接验证采集 → VAD → ASR 链路
+      ROBOTCHAT__PROVIDERS__WAKEWORD__ENABLED: ${SIM_WAKEWORD:-false}
+      # 常开聆听 + 云端 ASR 需要显式确认（FR-14.8）；sim 里没有本地 FunASR 服务
+      ROBOTCHAT__PROVIDERS__WAKEWORD__OPEN_EAR__CLOUD_ASR_ACK: "true"
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      MKL_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      NUMEXPR_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+    volumes:
+      - ../config:/app/config:ro
+      - robotchat-sim-data:/var/lib/robotchat
+      - robotchat-sim-logs:/var/log/robotchat
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 800M}
+        reservations: {memory: 300M}
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/api/ready',timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    networks: [sim]
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "5"}
+
+networks:
+  sim:
+    name: robotchat-sim
+    driver: bridge
+
+volumes:
+  robotchat-sim-data:
+  robotchat-sim-logs:

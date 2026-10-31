@@ -1,0 +1,2 @@
+# VAD / 唤醒词 ONNX 与提示音资产目录（deployment §2）
+# silero_vad.onnx（~2 MB）与 wakeword/*.onnx（2~5 MB）不随源码提交，构建时放入本目录。

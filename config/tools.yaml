@@ -1,0 +1,55 @@
+# 工具与安全策略模板（FR-9）
+
+tools:
+  policy:
+    whitelist: []                   # 为空表示不限制；非空时仅允许列出的工具
+    blacklist: []
+    rate_limit_per_minute: 30
+    high_risk_requires_confirm: true
+    confirm_timeout_ms: 10000       # 二次确认等待上限；超时/无法判定按取消（FR-9.10）
+
+  # 执行时长超过该阈值转为异步后台任务，不阻塞对话（T-5.9）
+  async_threshold_s: 3.0
+  # 单轮最多「工具执行 → 结果回灌」轮数
+  max_rounds: 2
+
+  definitions:
+    speak:
+      description: 让机器人播报指定内容
+      risk: low
+      timeout_s: 10
+      adapter: builtin
+      parameters:
+        type: object
+        properties:
+          text: { type: string, minLength: 1, maxLength: 200 }
+        required: [text]
+
+    navigate_to:
+      description: 导航到指定地点
+      risk: high                   # 移动类指令须二次确认（FR-9.10 / C-84）
+      timeout_s: 120
+      adapter: ros2
+      target: /robot/navigate_to
+      kind: action
+      parameters:
+        type: object
+        properties:
+          location: { type: string, minLength: 1 }
+          speed: { type: number, minimum: 0.1, maximum: 1.0 }
+        required: [location]
+
+    set_io:
+      description: 设置机器人 IO 输出通道
+      risk: medium
+      timeout_s: 10
+      adapter: ros2
+      target: /robot/set_io
+      kind: service
+      parameters:
+        type: object
+        properties:
+          channel: { type: integer, minimum: 0, maximum: 7 }
+          value: { type: boolean }
+        required: [channel, value]
+

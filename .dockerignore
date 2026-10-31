@@ -1,0 +1,20 @@
+# 构建上下文裁剪：镜像只需要 src/ config/ webui/ pyproject.toml README.md
+.git/
+.gitignore
+.trae/
+.screenshots/
+.venv/
+.venv-train/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+docs/
+var/
+logs/
+deploy/.env
+**/*.sqlite3
+node_modules/
+webui/dist/

@@ -1,0 +1,115 @@
+# 本体语音模型编排（拓扑 1，T-2.8、deployment §4.2）
+#
+# - 只包含机器人本体必需的语音模型：FunASR（流式 ASR）+ Qwen3-TTS（流式合成）
+# - LLM 与知识库默认在边端 / 云端，通过 LLM_BASE_URL / KB_BASE_URL 接入（A5、CON-12）
+# - 拓扑 2（算力充裕机型）追加本机 LLM 服务：`--profile topology2` 启用，独立 cgroup，
+#   与应用容器故障隔离（T-7.14 / C-133）
+# - 端口一律只绑 127.0.0.1：不对外暴露，仅允许本机应用访问
+# - 与主编排 deploy/docker-compose.yml 相互独立，可单独起停：
+#     docker compose -f deploy/docker-compose.models.yml up -d
+#     docker compose -f deploy/docker-compose.models.yml --profile topology2 up -d
+#     docker compose -f deploy/docker-compose.models.yml down
+#   应用侧对应配置：providers.asr.drivers.funasr_local.endpoint / providers.tts.drivers.qwen3_tts_local.base_url
+#   拓扑 2 另需 providers.llm.drivers.edge_llm.base_url=http://127.0.0.1:8000/v1
+
+x-model-logging: &model-logging
+  driver: json-file
+  options: {max-size: "50m", max-file: "3"}
+
+services:
+  funasr:
+    image: ${FUNASR_IMAGE:-funasr-runtime-sdk-cpu:latest}
+    container_name: robotchat-funasr
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FUNASR_PORT:-10095}:10095"   # 仅本机可访问（C-173）
+    command:
+      - "--model"
+      - "${FUNASR_MODEL:-paraformer-zh-streaming}"
+      - "--port"
+      - "10095"
+      - "--ngpu"
+      - "0"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - funasr-models:/models                       # 模型权重外置，不进应用镜像（CON-8）
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 2G}
+        reservations: {memory: 1G}
+    healthcheck:
+      # FunASR Runtime 未提供健康端点时，以端口可连接作为存活判据
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',10095))==0 else 1)\""
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    logging: *model-logging
+
+  tts:
+    image: ${QWEN3_TTS_IMAGE:-qwen3-tts-server:latest}
+    container_name: robotchat-tts
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QWEN3_TTS_PORT:-8091}:8091"   # 仅本机可访问（C-173）
+    environment:
+      TZ: Asia/Shanghai
+      TTS_PORT: "8091"
+    volumes:
+      - tts-models:/models                          # 音色与权重外置，不进应用镜像（ADR-13）
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 3G}
+        reservations: {memory: 1.5G}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',8091))==0 else 1)\""
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    logging: *model-logging
+
+  # 拓扑 2 可选：本机 LLM（vLLM / Ollama 等 OpenAI 兼容服务，T-7.14）
+  # 独立容器与 cgroup：OOMKill 或推理超时只影响 LLM，ASR / TTS / 对话链路不受牵连
+  llm:
+    profiles: ["topology2"]
+    image: ${LLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: robotchat-llm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LLM_PORT:-8000}:8000"          # 仅本机可访问
+    command:
+      - "--model"
+      - "${LLM_MODEL_PATH:-/models/Qwen2.5-7B-Instruct}"
+      - "--served-model-name"
+      - "${LLM_MODEL:-Qwen2.5-7B-Instruct}"
+      - "--port"
+      - "8000"
+    environment:
+      TZ: Asia/Shanghai
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+    volumes:
+      - llm-models:/models                          # 权重外置，不进应用镜像（CON-8）
+    deploy:
+      resources:
+        limits: {cpus: "${LLM_CPUS:-4.0}", memory: "${LLM_MEMORY:-8G}"}
+        reservations: {memory: 7G}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',8000))==0 else 1)\""
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    logging: *model-logging
+
+volumes:
+  funasr-models:
+  tts-models:
+  llm-models:

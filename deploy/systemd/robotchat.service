@@ -1,0 +1,33 @@
+# RobotChat systemd 服务单元（T-7.7 / C-128）
+#
+# 安装：
+#   sudo install -m 0644 deploy/systemd/robotchat.service /etc/systemd/system/robotchat.service
+#   sudo sed -i "s|/opt/robotchat|$(pwd)|g" /etc/systemd/system/robotchat.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now robotchat
+#
+# 说明：
+# - docker compose 自身负责 restart: unless-stopped 的崩溃自愈（T-7.9）；
+#   本单元保证开机后应用随 Docker 自动拉起（机器人重启场景，C-128）。
+# - 变量由 deploy/.env 提供给 compose，因此本单元不使用 EnvironmentFile
+#   （.env 中的行内注释会被 systemd 当作值的一部分）。
+# - 变更后执行 sudo systemctl daemon-reload。
+
+[Unit]
+Description=RobotChat full-duplex voice service (docker compose)
+Documentation=https://example.com/robotchat
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/robotchat/deploy
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecReload=/usr/bin/docker compose restart robotchat
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

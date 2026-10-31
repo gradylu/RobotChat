@@ -1,0 +1,50 @@
+# Docker 虚拟机器人音频 Profile（deploy/docker-compose.sim.yml 配套）
+#
+# 与 generic_ros_audio 的差别只有消息类型：假机器人容器里没有 audio_common_msgs，
+# 统一用 ROS2 基础镜像自带的 std_msgs/msg/UInt8MultiArray 承载 PCM16 字节流。
+# 话题名、采样率、分帧、停播语义都与真实机型保持一致，切回 generic_ros_audio 无需改业务代码。
+profile: sim_virtual_audio
+display_name: "Docker 虚拟机器人（std_msgs 字节流）"
+ros_distro: [humble, jazzy]
+robot_models: [sim_virtual_robot, sim]
+adapter: base_ros_audio
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: false          # 假机器人不做回声参考，AEC 请在 sim 里设 none
+  hardware_aec: false
+  volume_control: true
+  playback_flush: service
+
+capture:
+  kind: topic
+  topic: "/mic/audio_raw"
+  msg_type: "std_msgs/msg/UInt8MultiArray"
+  fields: {data: "data"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 20
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: arrival, unit: s, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/spk/audio_out"
+  msg_type: "std_msgs/msg/UInt8MultiArray"
+  fields: {data: "data"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  flush:
+    kind: service
+    service: "/spk/stop"
+    msg_type: "std_srvs/srv/Trigger"
+
+volume:
+  kind: topic
+  topic: "/spk/volume"
+  msg_type: "std_msgs/msg/Float32"
+  range: [0.0, 1.0]

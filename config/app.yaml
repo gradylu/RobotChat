@@ -1,0 +1,92 @@
+# RobotChat 应用配置模板（默认层，容器内挂载 /app/config 覆盖）
+# 优先级：环境变量 > 运行时变更（data/config_active.yaml）> 现场配置 > 本文件
+
+app:
+  name: robotchat
+  env: robot                # dev | sim | robot
+
+api:
+  host: 0.0.0.0
+  port: 8080
+  auth_token_env: ROBOTCHAT_API_TOKEN
+  protocol_version: v1
+
+audio:
+  transport: ros2_native    # ros2_native | ros2_bridge | file（ADR-02）
+  device_profile: generic_ros_audio  # 机型 Profile → config/devices/<name>.yaml（FR-16）
+  auto_detect_profile: false
+  fallback_profile: ""      # 自动探测失败兜底；为空则拒绝启动（FR-16.11）
+  capture:
+    target_sample_rate: 16000
+    target_channels: 1
+    target_bit_depth: 16
+    jitter_buffer_ms: 60
+  playback:
+    queue_ms: 300
+    flush_budget_ms: 100
+  aec:
+    mode: auto              # auto | hardware | software | none（A4、CON-13）
+    fallback_notice: true
+
+vad:
+  backend: silero           # silero | energy（energy 为无模型环境的诊断后端）
+  model_path: assets/silero_vad.onnx
+  threshold: 0.5
+  start_frames: 3
+  silence_ms: 700           # 尾点判定，单独计量（NFR-1）
+  max_utterance_ms: 30000
+
+barge_in:
+  mode: enabled             # enabled | disabled（disabled 退化为半双工，FR-6.5）
+  # guard_ms 留空 = 随 AEC 模式自适应：hardware 100 / software 200 / none 300
+  threshold_boost_db: 6
+  confirm_frames: 3
+  semantic_check: true
+  echo_similarity_threshold: 0.8
+
+state:
+  heartbeat_ms: 1000        # 全局心跳；无进展触发自恢复（FR-7.7）
+  resident_states: [IDLE, ACTIVE_IDLE]  # 常驻等待，不设状态超时（FR-7.2）
+  timeouts_ms:
+    BOOTING: 15000
+    WAKING: 5000
+    LISTENING: 15000
+    THINKING: 30000
+    SPEAKING: 60000
+    INTERRUPTING: 1000
+    EXECUTING: 120000
+    DEGRADED: 30000
+    ERROR: 60000
+
+memory:
+  backend: sqlite           # sqlite | redis（ADR-09）
+  sqlite_path: /var/lib/robotchat/robotchat.sqlite3
+  max_turns: 20
+  summary_trigger_turns: 10
+
+observability:
+  log_level: INFO
+  log_json: true
+  metrics_buffer_per_stage: 2000
+
+language:
+  mode: auto                # fixed | auto（FR-15.3）
+  fixed: zh
+  supported: [zh, en, yue, dongbei, wuhan, shanghai, tianjin]
+  fallback: zh
+  switch_confirm_turns: 2
+  min_chars: 6
+  asr_routing:
+    yue: dashscope_stream
+    dongbei: funasr_dialect
+    wuhan: funasr_dialect
+    shanghai: funasr_dialect
+    tianjin: funasr_dialect
+  tts_voices:
+    zh: {driver: qwen3_tts_local, voice: "default"}
+    en: {driver: qwen3_tts_local, voice: "en_female"}
+    yue: {driver: dashscope_tts, voice: "yue_female"}
+    dongbei: {driver: qwen3_tts_local, voice: "default", fallback_marked: true}
+    wuhan: {driver: qwen3_tts_local, voice: "default", fallback_marked: true}
+    shanghai: {driver: qwen3_tts_local, voice: "default", fallback_marked: true}
+    tianjin: {driver: qwen3_tts_local, voice: "default", fallback_marked: true}

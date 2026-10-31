@@ -1,0 +1,101 @@
+# 中文唤醒词训练配置（T-3A.2 / FR-14.14）
+#
+# 训练链路：TTS 合成样本 → mel/embedding 前端抽特征 → 训练 16×96 小网络 → 导出 ONNX
+#
+# 依赖隔离：torch 不在 design §1.1 白名单内，禁止装进应用环境；
+# 请用独立训练环境（tools/wakeword/run_train.ps1 会自动创建 .venv-train）。
+#
+# 用法（仓库根目录）：
+#   .\tools\wakeword\run_train.ps1 -Stage all
+#   python tools/wakeword/train_zh_wakeword.py prepare --config tools/wakeword/train_zh_wakeword.yaml
+#   python tools/wakeword/train_zh_wakeword.py train   --config tools/wakeword/train_zh_wakeword.yaml
+#   python tools/wakeword/train_zh_wakeword.py verify  --config tools/wakeword/train_zh_wakeword.yaml --wav x.wav
+
+model:
+  name: wake_robot_v1
+  phrase: "你好机器人"
+  # 与 config/providers.yaml 的 wakeword.drivers.openwakeword.model_paths 对齐；
+  # 产物落位后自检第 13 项由 WARN 变 PASS，无需改代码（FR-14.2）
+  output: "assets/wakeword/wake_robot_v1.onnx"
+  in_frames: 16          # 唤醒词模型输入帧数，须与运行时 OpenWakeWordOnnx 读取的形状一致
+  embedding_dim: 96      # embedding_model.onnx 输出维度
+
+frontend:
+  melspec_model_path: "assets/wakeword/melspectrogram.onnx"
+  embedding_model_path: "assets/wakeword/embedding_model.onnx"
+
+dataset:
+  work_dir: "var/wakeword_train"   # 中间产物（样本 / 权重 / 指标），已被 .gitignore 忽略
+  drop_warmup_embeddings: 10       # 丢弃前端补零产生的无信息 embedding
+  pad:
+    pre_s: [0.6, 1.6]              # 正样本前置静音/噪声时长范围：模拟真实唤醒前上下文
+    post_s: [0.2, 0.6]
+    label_tolerance_s: 0.3         # 词尾之后多少秒内仍算正样本（运行时会滞后 0.2~0.5s 触发）
+  split: {train: 0.7, val: 0.15, test: 0.15}
+  seed: 2026
+
+synth:
+  backend: "sapi"                  # http（本地 Qwen3-TTS，音色更丰富，推荐）| sapi（Windows 内置，离线兜底）| dir（真实录音）
+  http:
+    base_url: "http://127.0.0.1:8091"   # 与 providers.yaml 的 qwen3_tts_local 一致
+    path: "/audio/speech"
+    voice: "default"
+    lang: "zh"
+    timeout_s: 30
+  sapi:
+    voice: "Microsoft Huihui Desktop"   # 留空 = 系统默认音色（可能是英文，合成中文会失真）
+  positives:
+    # 变体覆盖语气词 / 停顿 / 前后缀，提升对真实口音的泛化；不要写入不含目标词的内容
+    variants:
+      - "你好机器人"
+      - "你好机器人。"
+      - "你好，机器人"
+      - "你好机器人啊"
+      - "那个，你好机器人"
+      - "嗯，你好机器人"
+      - "嘿，你好机器人"
+      - "你好机器人呀"
+    repeats: 8                     # 每个变体的合成次数（写入时施加不同增益，避免完全重复）
+    gain_db: [-3, 0, 3]
+    source_dir: ""                 # backend=dir 时从该目录读取真实正样本录音
+  negatives:
+    # 普通负样本 + 近似负样本（结构相近但不含目标词，专门压低误唤醒）
+    texts:
+      - "今天天气不错"
+      - "帮我打开空调"
+      - "现在几点了"
+      - "请播放一首歌"
+      - "前面还有多远"
+      - "我想去会议室"
+      - "打开充电桩"
+      - "关掉音乐"
+      - "这个多少钱"
+      - "我们出发吧"
+      - "小智小智"
+      - "你好小助手"
+      - "机器人你好"
+      - "你好呀机器人朋友"
+    repeats: 6
+    negative_wav_dir: ""           # 额外真实负样本目录（16 kHz 单声道 wav）
+    background_noise_dir: ""       # 背景噪声目录；留空则只做增益扰动
+    noise_mix_prob: 0.5            # 负样本叠噪概率
+    noise_snr_db: [5, 20]
+    noise_clips: 40                # 纯噪声负样本条数
+  negative_source_dir: ""          # backend=dir 时从该目录读取真实负样本录音
+
+train:
+  hidden: 128
+  epochs: 60
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  pos_weight: 1.0                  # >1 提升召回，<1 压低误唤醒（现场误报多时调小）
+  patience: 10
+  seed: 2026
+  device: "cpu"
+  opset: 13
+
+evaluate:
+  target_recall: 0.9               # 阈值标定：验证集召回下限
+  max_false_positive_rate: 0.01    # 阈值标定：负样本窗口误报率上限
+  runtime_check_clips: 3           # 用运行时后端（OpenWakeWordOnnx）复验的测试样本数

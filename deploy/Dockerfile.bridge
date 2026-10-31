@@ -1,0 +1,20 @@
+# RobotChat 宿主机 ROS2 桥接节点镜像（仅方案 B 需要，deployment §2 / ADR-02）
+# 构建：docker build --build-arg ROS_DISTRO=humble -t robotchat-bridge:<version>-humble \
+#         -f deploy/Dockerfile.bridge deploy/bridge
+ARG ROS_DISTRO=humble
+FROM ros:${ROS_DISTRO}-ros-base
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir "websockets>=12"
+
+WORKDIR /app
+COPY robotchat_bridge.py /app/robotchat_bridge.py
+
+# 桥接进程使用宿主机 DDS 域（compose 中同样需要 network_mode: host）
+CMD ["python3", "/app/robotchat_bridge.py"]

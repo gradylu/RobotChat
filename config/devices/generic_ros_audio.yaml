@@ -1,0 +1,45 @@
+profile: generic_ros_audio
+display_name: "通用 ROS2 音频机型"
+ros_distro: [humble, jazzy]
+robot_models: [generic_ros_audio, generic]
+adapter: base_ros_audio
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: true
+  hardware_aec: false
+  volume_control: true
+  playback_flush: service
+
+capture:
+  kind: topic
+  topic: "/mic/audio_raw"
+  msg_type: "audio_common_msgs/msg/AudioData"
+  fields: {data: "data"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 20
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: header_stamp, unit: ns, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/spk/audio_out"
+  msg_type: "audio_common_msgs/msg/AudioData"
+  fields: {data: "data"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  flush:
+    kind: service
+    service: "/spk/stop"
+    msg_type: "std_srvs/srv/Trigger"
+
+volume:
+  kind: topic
+  topic: "/spk/volume"
+  msg_type: "std_msgs/msg/Float32"
+  range: [0.0, 1.0]
