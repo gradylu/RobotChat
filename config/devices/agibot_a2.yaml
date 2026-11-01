@@ -1,0 +1,71 @@
+# 智元 A2（AimDK A2 旗舰款 v2.1）
+#
+# 状态：草稿。关键差异：采集走 ros2_plugin_proto/msg/RosMsgWrapper 内嵌 protobuf，
+# 话题名带 pb_3A... 后缀；播放在 /audiohal 下；音量与 TTS 是 HTTP RPC 而非 ROS2 服务。
+# ref: https://open.agibot.com/docs/aimdk/a2/v2_1/dev_guide/07-06-microphone
+#      https://open.agibot.com/docs/aimdk/a2/v2_1/dev_guide/07-05-audio_play
+profile: agibot_a2
+display_name: "智元 A2"
+ros_distro: [humble]
+ros_domain_id: 232                  # TODO-实测：文档示例写 ROS_DOMAIN_ID=232，需按现场确认
+robot_models: [agibot_a2, a2]
+adapter: agibot_ros2_plugin         # TODO-实测：需实现 protobuf 载荷解码（当前无适配器）
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: false             # 只有一路「降噪后」音频，无独立回采通道
+  hardware_aec: false               # 本体降噪链路内部已做回声消除，我们直接消费降噪流，不再跑 AEC
+  volume_control: true
+  playback_flush: none              # 流式 PCM 无公开停播接口，打断只能靠音量置零 / 放弃焦点
+
+capture:
+  kind: topic
+  topic: "/agent/process_audio_output/pb_3Aaimdk_2Eprotocol_2EProcessedAudioOutput"
+  msg_type: "ros2_plugin_proto/msg/RosMsgWrapper"
+  payload: protobuf
+  payload_type: "aimdk.protocol.ProcessedAudioOutput"
+  # TODO-实测：RosMsgWrapper 里承载序列化 pb 的字段名（文档未写明，暂按 msg）
+  fields: {data: "msg"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 20                      # TODO-实测：文档未公开帧长
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: header_stamp, unit: s, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/audiohal/audio/playback"
+  msg_type: "audio_msgs/msg/AudioPlayback"
+  payload: ros_msg
+  fields: {data: "data", token: "token_id"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  focus:
+    request_service: "/audio_5Fmsgs/srv/RequestAudioFocus"
+    abandon_service: "/audio_5Fmsgs/srv/AbandonAudioFocus"
+    request_msg_type: "audio_msgs/srv/RequestAudioFocus"
+    abandon_msg_type: "audio_msgs/srv/AbandonAudioFocus"
+    priority: 6
+  flush:
+    kind: none                      # 仅 TTS / 文件可停，流式 PCM 未公开停播（TODO-实测确认）
+
+volume:
+  kind: http_rpc
+  endpoint: "http://<robot-ip>:56666/rpc/aimdk.protocol.HalAudioService/SetAudioVolume"
+  field: "audio_volume"
+  mute_field: "is_mute"
+  range: [0.0, 70.0]                # 文档：A2 音量上限 70%
+
+preflight:
+  - "切换 run_mode=only_voice（SetAgentPropertiesRequest），随后重启交互模块"
+  - "开机后需联网完成音频鉴权（约 2 分钟）后才可用音频"
+  - "内外置麦可在配置中切换，外置麦 VAD 状态需补偿"
+
+notes:
+  - "文档示例 IP 192.168.100.110 仅为示意，endpoint 中的 <robot-ip> 须现场替换"
+  - "TTS 走 HTTP RPC TTSService/PlayTTS（≤1024 字节，非流式），本系统自研 TTS 不依赖它"
+  - "TODO-实测：话题后缀是否随固件变化、帧长、流式 PCM 停播方式（token_id 语义）"

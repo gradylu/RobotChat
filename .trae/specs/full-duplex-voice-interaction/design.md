@@ -184,6 +184,8 @@ class AudioPlaybackContract(Protocol):
 
 #### 3.6.2 机型 Profile（配置化，不硬编码）
 
+> 首批需交付的 5 份 Profile（A11 / FR-16.12）：`agibot_x2_pro`（智元灵犀 X2 Pro 探索版）、`agibot_x2_ultra`（智元灵犀 X2 Ultra 旗舰版）、`agibot_a2`（智元 A2）、`agibot_a3`（智元 A3）、`unitree_g1`（宇树 G1）。下方结构为模板，各机型字段按 D12 采集结果填写。
+
 ```yaml
 # config/devices/<model>.yaml
 profile: acr-robot-v2            # Profile 名，由 audio.device_profile 选择

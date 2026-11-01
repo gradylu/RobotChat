@@ -1,0 +1,71 @@
+# 智元灵犀 X2 Ultra 旗舰版（AimDK_X2 v0.8，交互模块官方支持版本）
+#
+# 状态：草稿。与 agibot_x2_pro 的音频契约相同，独立成文件是因为两版要分别验收（FR-16.12）。
+# 若实测证明两版接口完全一致，可保留两份 Profile 但共用同一适配器实现。
+# ref: https://x2-aimdk.agibot.com/zh-cn/latest/Interface/interactor/voice.html
+profile: agibot_x2_ultra
+display_name: "智元灵犀 X2 Ultra 旗舰版"
+ros_distro: [humble]
+robot_models: [agibot_x2_ultra, agibot_lingxi_x2_ultra, x2_ultra]
+adapter: agibot_aimdk_msgs          # TODO-实测：适配器尚未实现（aimdk_msgs + token_id 续播语义）
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: true
+  hardware_aec: false               # TODO-实测：本体 AEC 是否默认启用
+  volume_control: true
+  playback_flush: topic_msg
+
+capture:
+  kind: topic
+  topic: "/agent/process_audio_output"
+  msg_type: "aimdk_msgs/msg/ProcessedAudioOutput"
+  payload: ros_msg
+  fields: {data: "audio_data", stream: "stream_id", vad: "audio_vad_state"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 40                      # TODO-实测：文档约 25 Hz
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: header_stamp, unit: s, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/aima/hal/audio/playback"
+  msg_type: "aimdk_msgs/msg/AudioPlayback"
+  payload: ros_msg
+  fields: {data: "audio_data", token: "token_id"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  focus:
+    request_service: "/aimdk_5Fmsgs/srv/RequestAudioFocus"
+    abandon_service: "/aimdk_5Fmsgs/srv/AbandonAudioFocus"
+    request_msg_type: "aimdk_msgs/srv/RequestAudioFocus"
+    abandon_msg_type: "aimdk_msgs/srv/AbandonAudioFocus"
+    priority: 6
+  flush:
+    kind: topic_msg
+    topic: "/aima/hal/audio/playback"
+    msg_type: "aimdk_msgs/msg/AudioPlayback"
+    payload: "new_token_id"
+
+volume:
+  kind: ros2_service
+  service: "/aimdk_5Fmsgs/srv/SetVolume"
+  msg_type: "aimdk_msgs/srv/SetVolume"
+  field: "audio_volume"
+  mute_field: "is_mute"
+  range: [0.0, 100.0]
+
+preflight:
+  - "ros2 service call /aimdk_5Fmsgs/srv/SetAgentPropertiesRequest aimdk_msgs/srv/SetAgentPropertiesRequest '{properties: [{key: 2, value: only_voice}]}'"
+  - "aima em stop-app agent"
+  - "aima em start-app agent"
+
+notes:
+  - "X2 EDU（人人造版）不支持交互模块，不在交付范围"
+  - "另有原始流 /aima/hal/audio/capture（aimdk_msgs/msg/AudioCapture），用作 AEC 参考"
+  - "TODO-实测：与 Pro 探索版的接口差异、frame_ms、AEC 默认状态"

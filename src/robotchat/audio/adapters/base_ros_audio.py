@@ -15,6 +15,7 @@ import time
 from array import array
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Protocol
 
 import numpy as np
@@ -48,6 +49,8 @@ class PublishSpec:
     topic: str
     msg_type: str
     field: str = "data"
+    # 消息里的附加字段（如灵犀 X2 的 token_id / pkg_name / priority）
+    extra_fields: dict[str, Any] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +58,8 @@ class ServiceSpec:
     service: str
     msg_type: str
     call_timeout_s: float = 1.0
+    # 请求字段（如 SetVolume 的 audio_volume、音频焦点的 pkg_name / priority）
+    fields: dict[str, Any] = dataclass_field(default_factory=dict)
 
 
 class RosAudioBackend(Protocol):
@@ -289,6 +294,9 @@ class BaseRosAudioAdapter:
 
     def _convert(self, payload: bytes, stamp: float | None) -> list[AudioFrame]:
         capture = self.profile.capture
+        payload = self._decode_capture_payload(payload)
+        if not payload:
+            return []
         samples = decode_pcm(payload, capture.bit_depth, capture.channels)
         if capture.channels != self.target_channels:
             samples = convert_channels(samples, capture.channels, self.target_channels)
@@ -318,6 +326,10 @@ class BaseRosAudioAdapter:
         self.frames_captured += len(frames)
         return frames
 
+    def _decode_capture_payload(self, payload: bytes) -> bytes:
+        """采集载荷 → PCM 字节（默认直通）。内嵌 protobuf 的机型（A2、A3）覆写本方法。"""
+        return payload
+
     def _normalize_ts(self, stamp: float | None) -> float:
         """设备时间戳归一为单调递增秒；不可靠时退化为到达时间（design §3.6.4）。"""
         if stamp is None:
@@ -340,6 +352,19 @@ class BaseRosAudioAdapter:
     async def play(self, chunk: AudioChunk) -> None:
         if not self._opened or self._closed:
             raise RuntimeError("设备适配器未打开：play() 前须先 open()")
+        payload = self._prepare_playback_payload(chunk)
+
+        if self._volume_restore is not None:
+            # flush(volume_to_zero) 后的第一帧：恢复音量再出声
+            await self.set_volume(self._volume_restore)
+            self._volume_restore = None
+
+        spec = self._playback_spec()
+        await self._backend.publish(spec, payload)
+        self.played_chunks += 1
+
+    def _prepare_playback_payload(self, chunk: AudioChunk) -> bytes:
+        """播放前的采样率 / 声道 / 位深转换；非 ROS2 机型（宇树 G1）复用本方法。"""
         playback = self.profile.playback
         samples = decode_pcm(chunk.data, chunk.bit_depth, chunk.channels)
         if chunk.channels != playback.channels:
@@ -347,20 +372,16 @@ class BaseRosAudioAdapter:
         samples = np.asarray(samples, dtype=np.float32)
         if chunk.sample_rate != playback.sample_rate:
             samples = resample_float(samples, chunk.sample_rate, playback.sample_rate)
-        payload = encode_pcm(samples, playback.bit_depth)
+        return encode_pcm(samples, playback.bit_depth)
 
-        if self._volume_restore is not None:
-            # flush(volume_to_zero) 后的第一帧：恢复音量再出声
-            await self.set_volume(self._volume_restore)
-            self._volume_restore = None
-
-        spec = PublishSpec(
+    def _playback_spec(self) -> PublishSpec:
+        """播放消息规格；机型专属字段（token_id、pkg_name 等）由子类覆写。"""
+        playback = self.profile.playback
+        return PublishSpec(
             topic=playback.topic,
             msg_type=playback.msg_type,
             field=playback.fields.get("data", "data"),
         )
-        await self._backend.publish(spec, payload)
-        self.played_chunks += 1
 
     async def flush(self) -> None:
         """按 Profile 声明的策略立即停播（T-1A.4 / FR-16.6）。"""
@@ -396,14 +417,25 @@ class BaseRosAudioAdapter:
                 raise RuntimeError("flush(volume_to_zero) 需要 Profile 声明 volume 配置")
             self._volume_restore = self._volume
             await self.set_volume(self.profile.volume.range[0])
+        elif flush.kind == "none":
+            # A2 / A3 的流式 PCM 没有停播接口：只能记录，由上层退化为音量置零或放弃焦点
+            logger.warning(
+                "device_flush_unsupported",
+                profile=self.profile_name,
+                hint="接口层无停播能力，Barge-in 请退化到 volume_to_zero 或放弃音频焦点",
+            )
+            return
         else:  # pragma: no cover - Literal 已限制
             raise RuntimeError(f"未知 flush 策略：{flush.kind}")
+        self._mark_flush(started)
+
+    def _mark_flush(self, started: float) -> None:
         self.flush_count += 1
         self.last_flush_ms = round((self._clock() - started) * 1000.0, 2)
         logger.debug(
             "device_flush",
             profile=self.profile_name,
-            strategy=flush.kind,
+            strategy=self.profile.playback.flush.kind,
             elapsed_ms=self.last_flush_ms,
         )
 
@@ -533,6 +565,7 @@ class RclpyBackend:
         slot = self._publisher(spec)
         msg = slot.msg_type()
         _assign(msg, spec.field, array("B", payload))
+        _assign_extra(msg, spec.extra_fields)
         slot.publisher.publish(msg)
 
     async def publish_float(self, spec: PublishSpec, value: float) -> None:
@@ -551,6 +584,7 @@ class RclpyBackend:
         if not ready:
             raise RuntimeError(f"停播服务不可用：{spec.service}")
         request = msg_type.Request()
+        _assign_extra(request, spec.fields)
         await asyncio.to_thread(client.call, request)
 
     async def close(self) -> None:
@@ -627,6 +661,15 @@ def _assign(msg: Any, path: str, value: Any) -> None:
     for part in parts[:-1]:
         target = getattr(target, part)
     setattr(target, parts[-1], value)
+
+
+def _assign_extra(msg: Any, fields: dict[str, Any]) -> None:
+    """按点路径写入消息字段；嵌套对象不存在时跳过，不让机型字段差异打断主链路。"""
+    for path, value in fields.items():
+        try:
+            _assign(msg, path, value)
+        except AttributeError:
+            logger.warning("device_field_missing", field=path, msg_type=type(msg).__name__)
 
 
 __all__ = [

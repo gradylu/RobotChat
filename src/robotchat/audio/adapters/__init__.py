@@ -43,8 +43,13 @@ def create_device_adapter(
     return factory(profile, **kwargs)
 
 
-# 导入即登记通用 ROS2 适配器（其他机型适配器在此追加 import）
-from robotchat.audio.adapters import base_ros_audio  # noqa: E402, F401
+# 导入即登记各机型适配器（新增机型在此追加 import）
+from robotchat.audio.adapters import (  # noqa: E402
+    agibot_aimdk_msgs,  # noqa: F401
+    agibot_ros2_plugin,  # noqa: F401
+    base_ros_audio,  # noqa: F401
+    unitree_g1_native,  # noqa: F401
+)
 
 __all__ = [
     "DEVICE_ADAPTERS",

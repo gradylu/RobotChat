@@ -420,11 +420,19 @@ class ProfileQos(BaseModel):
 
 
 class ProfileCapture(BaseModel):
+    """采集接口：ROS2 话题，或脱离 ROS2 的组播 / 原生 SDK 音频流（D12）。"""
+
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["topic"] = "topic"
-    topic: str
-    msg_type: str
+    kind: Literal["topic", "udp_multicast"] = "topic"
+    topic: str = ""
+    msg_type: str = ""
+    # 载荷形态：标准 ROS 消息 / 内嵌 protobuf（A2、A3 的 RosMsgWrapper）/ 裸 PCM（宇树 G1）
+    payload: Literal["ros_msg", "protobuf", "raw_pcm"] = "ros_msg"
+    payload_type: str = ""
+    multicast_address: str = ""
+    multicast_port: int = Field(default=0, ge=0)
+    # 字段映射：data / stream / vad / ref 对应各自消息里的字段名
     fields: dict[str, str] = Field(default_factory=lambda: {"data": "data"})
     sample_rate: int = Field(gt=0)
     channels: int = Field(default=1, ge=1)
@@ -437,17 +445,33 @@ class ProfileCapture(BaseModel):
     def _check_format(self) -> ProfileCapture:
         if self.bit_depth not in (8, 16, 32):
             raise ValueError(f"capture.bit_depth={self.bit_depth} 仅支持 8 / 16 / 32")
-        if not self.topic or not self.msg_type:
-            raise ValueError("capture.topic / capture.msg_type 不能为空")
+        if self.kind == "topic":
+            if not self.topic or not self.msg_type:
+                raise ValueError("capture.topic / capture.msg_type 不能为空")
+            if self.payload == "protobuf" and not self.payload_type:
+                raise ValueError("capture.payload=protobuf 时须声明 payload_type")
+        else:
+            if not self.multicast_address or self.multicast_port <= 0:
+                raise ValueError(
+                    "capture.kind=udp_multicast 时须声明 multicast_address / multicast_port"
+                )
+            if self.payload != "raw_pcm":
+                raise ValueError("capture.kind=udp_multicast 仅支持 payload=raw_pcm")
         return self
 
 
 class ProfileFlush(BaseModel):
-    """立即停播方式（FR-16.6）：service / topic_msg / stream_stop / volume_to_zero。"""
+    """立即停播方式（FR-16.6）：service / topic_msg / stream_stop / volume_to_zero / none。
+
+    `none` 表示接口层无停播能力（A2、A3 的流式 PCM 即如此），
+    barge-in 只能退化到音量置零或放弃音频焦点。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["stream_stop", "service", "topic_msg", "volume_to_zero"] = "stream_stop"
+    kind: Literal["stream_stop", "service", "topic_msg", "volume_to_zero", "none"] = (
+        "stream_stop"
+    )
     service: str = ""
     topic: str = ""
     msg_type: str = ""
@@ -462,34 +486,71 @@ class ProfileFlush(BaseModel):
         return self
 
 
-class ProfilePlayback(BaseModel):
+class ProfileFocus(BaseModel):
+    """音频焦点：智元机型播放前须申请，否则与本体自带 TTS / 交互抢占音频流（D12）。"""
+
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["topic"] = "topic"
-    topic: str
-    msg_type: str
+    request_service: str = ""
+    abandon_service: str = ""
+    request_msg_type: str = ""
+    abandon_msg_type: str = ""
+    priority: int = Field(default=6, ge=0, le=10)
+    weight: str = ""
+
+    @model_validator(mode="after")
+    def _check_service(self) -> ProfileFocus:
+        if not self.request_service:
+            raise ValueError("focus.request_service 不能为空")
+        if not self.request_msg_type:
+            raise ValueError("focus.request_msg_type 不能为空（服务类型须显式声明）")
+        return self
+
+
+class ProfilePlayback(BaseModel):
+    """播放接口：ROS2 话题，或 DDS RPC（宇树 G1 的 AudioClient，不经 ROS2）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["topic", "dds_rpc"] = "topic"
+    topic: str = ""
+    msg_type: str = ""
+    # 非 ROS2 播放：SDK 方法与停播方法（如 AudioClient::PlayStream / PlayStop）
+    rpc_api: str = ""
+    rpc_stop_api: str = ""
+    payload: Literal["ros_msg", "raw_pcm"] = "raw_pcm"
     fields: dict[str, str] = Field(default_factory=lambda: {"data": "data"})
     sample_rate: int = Field(gt=0)
     channels: int = Field(default=1, ge=1)
     bit_depth: int = 16
     latency_ms: int = Field(default=60, ge=0)
+    focus: ProfileFocus | None = None
     flush: ProfileFlush = Field(default_factory=ProfileFlush)
 
     @model_validator(mode="after")
     def _check_format(self) -> ProfilePlayback:
         if self.bit_depth not in (8, 16, 32):
             raise ValueError(f"playback.bit_depth={self.bit_depth} 仅支持 8 / 16 / 32")
-        if not self.topic or not self.msg_type:
-            raise ValueError("playback.topic / playback.msg_type 不能为空")
+        if self.kind == "topic":
+            if not self.topic or not self.msg_type:
+                raise ValueError("playback.topic / playback.msg_type 不能为空")
+        elif not self.rpc_api:
+            raise ValueError("playback.kind=dds_rpc 时须声明 rpc_api")
         return self
 
 
 class ProfileVolume(BaseModel):
+    """音量控制入口：ROS2 话题 / ROS2 服务（灵犀 X2）/ HTTP RPC（A2、A3）。"""
+
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["topic"] = "topic"
-    topic: str
+    kind: Literal["topic", "ros2_service", "http_rpc"] = "topic"
+    topic: str = ""
     msg_type: str = "std_msgs/msg/Float32"
+    service: str = ""
+    endpoint: str = ""
+    field: str = "volume"
+    mute_field: str = ""
     range: tuple[float, float] = (0.0, 1.0)
 
     @model_validator(mode="after")
@@ -497,6 +558,12 @@ class ProfileVolume(BaseModel):
         low, high = self.range
         if low >= high:
             raise ValueError(f"volume.range 非法：{self.range}")
+        if self.kind == "topic" and not self.topic:
+            raise ValueError("volume.kind=topic 时须声明 volume.topic")
+        if self.kind == "ros2_service" and not self.service:
+            raise ValueError("volume.kind=ros2_service 时须声明 volume.service")
+        if self.kind == "http_rpc" and not self.endpoint:
+            raise ValueError("volume.kind=http_rpc 时须声明 volume.endpoint")
         return self
 
 
@@ -509,7 +576,7 @@ class ProfileCapabilities(BaseModel):
     hardware_aec: bool = False
     volume_control: bool = True
     playback_flush: Literal[
-        "stream_stop", "service", "topic_msg", "volume_to_zero"
+        "stream_stop", "service", "topic_msg", "volume_to_zero", "none"
     ] = "stream_stop"
 
 
@@ -521,12 +588,16 @@ class DeviceProfileSchema(BaseModel):
     profile: str
     display_name: str = ""
     ros_distro: list[str] = Field(default_factory=list)
+    ros_domain_id: int | None = Field(default=None, ge=0)
     robot_models: list[str] = Field(default_factory=list)
     adapter: str = "base_ros_audio"
     capabilities: ProfileCapabilities = Field(default_factory=ProfileCapabilities)
     capture: ProfileCapture
     playback: ProfilePlayback
     volume: ProfileVolume | None = None
+    # 上线前置操作（关闭本体自带语音系统、切唤醒模式等，D12 采集）
+    preflight: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> DeviceProfileSchema:

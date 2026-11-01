@@ -1,0 +1,72 @@
+# 智元灵犀 X2 Pro 探索版（文档依据：AimDK_X2 v0.8，交互模块仅 Ultra / Ultra 焕新支持）
+#
+# 状态：草稿。字段来源为官方文档推断，未上真机校验，凡标 TODO-实测 的项须现场确认后再启用。
+# 前置条件：本体默认进入内置语音交互并占用音频流，须先切 only_voice 并重启 agent 模块（preflight）。
+# ref: https://x2-aimdk.agibot.com/zh-cn/latest/Interface/interactor/voice.html
+#      https://x2-aimdk.agibot.com/zh-cn/latest/faq/temp_works.html
+profile: agibot_x2_pro
+display_name: "智元灵犀 X2 Pro 探索版"
+ros_distro: [humble]
+robot_models: [agibot_x2_pro, agibot_lingxi_x2_pro, x2_pro]
+adapter: agibot_aimdk_msgs          # TODO-实测：适配器尚未实现（aimdk_msgs + token_id 续播语义）
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: true              # 原始流 AudioCapture 暴露 ref_channels（回采参考）
+  hardware_aec: false               # TODO-实测：文档未说明本体 AEC 默认是否启用
+  volume_control: true
+  playback_flush: topic_msg         # 换 token_id 即清播放缓存
+
+capture:
+  kind: topic
+  topic: "/agent/process_audio_output"                       # 降噪 + VAD 输出流
+  msg_type: "aimdk_msgs/msg/ProcessedAudioOutput"
+  payload: ros_msg
+  fields: {data: "audio_data", stream: "stream_id", vad: "audio_vad_state"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 40                      # TODO-实测：文档约 25 Hz，实际帧长待确认
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: header_stamp, unit: s, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/aima/hal/audio/playback"
+  msg_type: "aimdk_msgs/msg/AudioPlayback"
+  payload: ros_msg
+  fields: {data: "audio_data", token: "token_id"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  focus:
+    request_service: "/aimdk_5Fmsgs/srv/RequestAudioFocus"
+    abandon_service: "/aimdk_5Fmsgs/srv/AbandonAudioFocus"
+    request_msg_type: "aimdk_msgs/srv/RequestAudioFocus"
+    abandon_msg_type: "aimdk_msgs/srv/AbandonAudioFocus"
+    priority: 6
+  flush:
+    kind: topic_msg
+    topic: "/aima/hal/audio/playback"
+    msg_type: "aimdk_msgs/msg/AudioPlayback"
+    payload: "new_token_id"         # 同一 token_id 续播，换 token_id 清空缓存
+
+volume:
+  kind: ros2_service
+  service: "/aimdk_5Fmsgs/srv/SetVolume"
+  msg_type: "aimdk_msgs/srv/SetVolume"
+  field: "audio_volume"
+  mute_field: "is_mute"
+  range: [0.0, 100.0]
+
+preflight:
+  - "ros2 service call /aimdk_5Fmsgs/srv/SetAgentPropertiesRequest aimdk_msgs/srv/SetAgentPropertiesRequest '{properties: [{key: 2, value: only_voice}]}'"
+  - "aima em stop-app agent"
+  - "aima em start-app agent"
+
+notes:
+  - "文档未列出「Pro 探索版」条目，按用户确认等同于 Ultra 焕新，音频契约沿用 Ultra"
+  - "另有原始流 /aima/hal/audio/capture（aimdk_msgs/msg/AudioCapture，含 mic_channels / ref_channels），用作 AEC 参考"
+  - "TODO-实测：frame_ms、原始流实际通道数、AEC 默认状态、VAD 状态码语义"

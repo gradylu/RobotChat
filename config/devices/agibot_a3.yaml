@@ -1,0 +1,70 @@
+# 智元 A3（AimDK A3 v3.3）
+#
+# 状态：草稿。音频契约与 A2 同构，差异：需重启整机、推荐外置麦、外置麦 VAD 状态码整体偏移。
+# 音量接口在中英文文档中不一致（ConfigControl vs SetAudioVolume），须现场实测确认。
+# ref: https://open.agibot.com/docs/aimdk/a3/v3_3/dev_guide/07-03-microphone
+#      https://open.agibot.com/docs/aimdk/a3/v3_3/dev_guide/07-02-audio_play
+profile: agibot_a3
+display_name: "智元 A3"
+ros_distro: [humble]
+robot_models: [agibot_a3, a3]
+adapter: agibot_ros2_plugin         # TODO-实测：与 A2 共用 protobuf 适配器
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: false
+  hardware_aec: false               # 本体降噪链路内部已做回声消除，我们直接消费降噪流，不再跑 AEC
+  volume_control: true
+  playback_flush: none
+
+capture:
+  kind: topic
+  topic: "/agent/process_audio_output/pb_3Aaimdk_2Eprotocol_2EProcessedAudioOutput"
+  msg_type: "ros2_plugin_proto/msg/RosMsgWrapper"
+  payload: protobuf
+  payload_type: "aimdk.protocol.ProcessedAudioOutput"
+  # TODO-实测：RosMsgWrapper 里承载序列化 pb 的字段名（文档未写明，暂按 msg）
+  fields: {data: "msg"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 20                      # TODO-实测
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: header_stamp, unit: s, monotonic: true}
+
+playback:
+  kind: topic
+  topic: "/audiohal/audio/playback"
+  msg_type: "audio_msgs/msg/AudioPlayback"
+  payload: ros_msg
+  fields: {data: "data", token: "token_id"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60
+  focus:
+    request_service: "/audio_5Fmsgs/srv/RequestAudioFocus"
+    abandon_service: "/audio_5Fmsgs/srv/AbandonAudioFocus"
+    request_msg_type: "audio_msgs/srv/RequestAudioFocus"
+    abandon_msg_type: "audio_msgs/srv/AbandonAudioFocus"
+    priority: 6
+  flush:
+    kind: none
+
+volume:
+  kind: http_rpc
+  endpoint: "http://<robot-ip>:56666/rpc/aimdk.protocol.HalAudioService/SetAudioVolume"
+  field: "audio_volume"
+  mute_field: "is_mute"
+  range: [0.0, 100.0]               # TODO-实测：A3 上限未明确
+
+preflight:
+  - "切换 run_mode=only_voice（SetAgentPropertiesRequest）"
+  - "重启整机（A3 须整机重启，非仅重启 agent 模块）"
+  - "开机后联网完成音频鉴权；优先使用外置麦"
+
+notes:
+  - "外置麦的 VAD 状态码整体偏移 1，适配器需补偿（vad_state + 1）"
+  - "内置麦在 3.2 版本有严重问题，3.3 是否修复待实测"
+  - "TODO-实测：音量接口名与端口、话题后缀、帧长"

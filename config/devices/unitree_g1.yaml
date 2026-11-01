@@ -1,0 +1,54 @@
+# 宇树 G1（unitree_sdk2，音频链路完全不走 ROS2）
+#
+# 状态：草稿。关键差异：麦克风是组播 UDP 裸 PCM（239.168.123.161:5555），
+# 播放是 DDS RPC（AudioClient::PlayStream），音量走 SDK 函数而非话题/服务。
+# 因此本 Profile 需要独立的原生适配器，不能复用 base_ros_audio。
+# ref: https://support.unitree.com/home/zh/G1_developer/VuiClient_Service
+profile: unitree_g1
+display_name: "宇树 G1"
+ros_distro: []                      # 音频链路不经 ROS2；旁路 unitree_ros2 仅在需要时启用
+robot_models: [unitree_g1, g1]
+adapter: unitree_g1_native          # TODO-实测：适配器尚未实现
+
+capabilities:
+  capture: true
+  playback: true
+  echo_reference: false             # 文档未提供回采参考通道
+  hardware_aec: false               # TODO-实测：是否有硬件 AEC
+  volume_control: false             # 音量是 SDK 调用，非话题/服务，当前 schema 不承载
+  playback_flush: stream_stop       # AudioClient::PlayStop 可中途停止
+
+capture:
+  kind: udp_multicast
+  multicast_address: "239.168.123.161"
+  multicast_port: 5555
+  payload: raw_pcm
+  fields: {data: "payload"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  frame_ms: 20                      # TODO-实测：组播包帧长与到达节拍
+  qos: {reliability: best_effort, depth: 10}
+  timestamp: {source: arrival, unit: s, monotonic: true}
+
+playback:
+  kind: dds_rpc
+  rpc_api: "unitree::robot::g1::AudioClient::PlayStream"
+  rpc_stop_api: "unitree::robot::g1::AudioClient::PlayStop"
+  payload: raw_pcm
+  fields: {data: "pcm"}
+  sample_rate: 16000
+  channels: 1
+  bit_depth: 16
+  latency_ms: 60                    # TODO-实测
+  flush:
+    kind: stream_stop
+
+preflight:
+  - "用手机 APP 或遥控器切到「唤醒模式」，否则麦克风无音频数据"
+  - "要求 vui_service >= 2.0.3.8、vui module >= 2.0.0.3"
+
+notes:
+  - "stream_id 相同为续播缓存，不同即打断；PlayStop(app_name) 可中途停止"
+  - "ASR 话题 rt/audio_msg（std_msgs/msg/String）走 DDS，但本系统自研 ASR 不依赖它"
+  - "TODO-实测：组播包帧长、AEC 能力、播放时延、多 app 并发策略、是否需要 ROS2 桥节点"
