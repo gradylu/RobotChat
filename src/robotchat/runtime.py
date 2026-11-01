@@ -24,6 +24,7 @@ from robotchat.config.loader import (
 )
 from robotchat.config.schema import Settings
 from robotchat.core.orchestrator import DialogOrchestrator, build_provider_report
+from robotchat.dialog.intent import IntentRouter
 from robotchat.dialog.memory import SqliteMemoryStore
 from robotchat.dialog.rag import RagService
 from robotchat.dialog.session import SessionStore
@@ -311,9 +312,21 @@ class AppRuntime:
             if self.dialogue is not None:
                 self.dialogue.tools = self.tools
             applied.append("tools")
+        if "intent" in changed:
+            self._rebuild_intent()
+            if self.dialogue is not None:
+                await self.dialogue.reload_intent()
+            applied.append("intent")
         restart.extend(section for section in changed if section not in applied)
         self.refresh_driver_status()
         return applied, restart
+
+    def _rebuild_intent(self) -> None:
+        """按最新 intent 配置重建语义分类槽位（热更新不打断当前会话）。"""
+        intent = self.settings.intent
+        if not intent.enabled or intent.active in {"", "none"}:
+            return
+        self.registry.register_slot("intent", intent.active, _intent_driver_config(intent))
 
     def _rebuild_provider(self, kind: str) -> None:
         """按新配置重建 provider 槽位（热切换不打断当前会话，后续轮次生效）。"""
@@ -539,6 +552,29 @@ def _build_rag(settings: Settings, registry: ProviderRegistry) -> RagService:
     return RagService.from_config(retriever, cfg, enabled=retriever is not None)
 
 
+def _intent_driver_config(intent: Any) -> dict[str, Any]:
+    """组装意图驱动配置：意图集合注入驱动（C-178），HTTP 超时略大于路由预算。"""
+    cfg = dict(intent.drivers.get(intent.active, {}))
+    cfg.setdefault(
+        "intents",
+        {name: item.model_dump() for name, item in intent.intents.items()},
+    )
+    cfg.setdefault("timeout_ms", intent.classify_timeout_ms + 100)
+    return cfg
+
+
+def _build_intent_router(
+    settings: Settings, registry: ProviderRegistry, metrics: MetricsCollector
+) -> IntentRouter | None:
+    """启用意图识别时注册语义分类槽位并构建路由（FR-17 / R14）。"""
+    intent = settings.intent
+    if not intent.enabled or intent.active in {"", "none"}:
+        logger.info("intent_disabled")
+        return None
+    registry.register_slot("intent", intent.active, _intent_driver_config(intent))
+    return IntentRouter(settings, registry, metrics)
+
+
 def _legacy_driver_configs(settings: Settings) -> dict[str, tuple[str, dict[str, Any]]]:
     """非模型类驱动（Phase 1 已有）：KWS / 传输 / VAD / 记忆。"""
     configs: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -638,6 +674,7 @@ def build_runtime(settings: Settings, config_dir: Path, data_dir: Path) -> AppRu
         else None
     )
     tools = build_tool_registry(settings.tools)
+    intent_router = _build_intent_router(settings, registry, metrics)
     runtime = AppRuntime(
         settings=settings,
         registry=registry,
@@ -659,6 +696,7 @@ def build_runtime(settings: Settings, config_dir: Path, data_dir: Path) -> AppRu
             session_id="default",
             transport=device_transport,
             aec_mode=aec_mode,
+            intent_router=intent_router,
         ),
         legacy_statuses=legacy,
         aec_mode=aec_mode,

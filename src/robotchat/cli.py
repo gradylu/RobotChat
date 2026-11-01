@@ -6,6 +6,8 @@
     robotchat wake test --input var/wake_test.wav
     robotchat wake status --url http://127.0.0.1:8080
     robotchat session reset --session default --url http://127.0.0.1:8080
+    robotchat intent list
+    robotchat intent test --text "停止播报"
 """
 
 from __future__ import annotations
@@ -97,9 +99,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wake_status_parser.add_argument("--token", default="", help="API Token（默认读环境变量）")
 
-    doctor = subparsers.add_parser("doctor", help="启动自检（18 项 PASS / WARN / FAIL）")
+    doctor = subparsers.add_parser("doctor", help="启动自检（19 项 PASS / WARN / FAIL）")
     doctor.add_argument("--strict", action="store_true", help="存在 FAIL 时以非零码退出")
     doctor.add_argument("--json", action="store_true", help="以 JSON 输出结论")
+
+    intent = subparsers.add_parser("intent", help="意图识别诊断（FR-17）")
+    intent_sub = intent.add_subparsers(dest="command", required=True)
+    intent_sub.add_parser("list", help="查看意图配置（集合 / 阈值 / 快速路径标记）")
+    intent_test_parser = intent_sub.add_parser("test", help="试跑一条话语的意图判定")
+    intent_test_parser.add_argument("--text", required=True, help="待判定的文本")
+    intent_test_parser.add_argument("--lang", default="", help="语言（留空按默认）")
+    intent_test_parser.add_argument(
+        "--url", default="http://127.0.0.1:8080", help="服务地址"
+    )
+    intent_test_parser.add_argument("--token", default="", help="API Token（默认读环境变量）")
 
     diagnose = subparsers.add_parser("diagnose", help="故障诊断包")
     diagnose_sub = diagnose.add_subparsers(dest="command", required=True)
@@ -148,6 +161,52 @@ def wake_status(
     try:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         response = http.get(f"{url.rstrip('/')}/api/wake", headers=headers)
+        response.raise_for_status()
+        return dict(response.json())
+    finally:
+        if owns_client:
+            http.close()
+
+
+def intent_list() -> dict[str, Any]:
+    """读取 config/intent.yaml 输出意图配置摘要（C-178：集合全部来自配置）。"""
+    settings = load_settings()
+    intent = settings.intent
+    return {
+        "enabled": intent.enabled,
+        "active": intent.active,
+        "confidence_threshold": intent.confidence_threshold,
+        "classify_timeout_ms": intent.classify_timeout_ms,
+        "gray_zone_top": intent.gray_zone_top,
+        "intents": {
+            name: {
+                "description": item.description,
+                "fast_path": item.fast_path,
+                "examples": list(item.examples[:5]),
+            }
+            for name, item in intent.intents.items()
+        },
+    }
+
+
+def intent_test(
+    *,
+    text: str,
+    lang: str = "",
+    url: str = "http://127.0.0.1:8080",
+    token: str = "",
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """调用 `POST /api/intents/test` 试跑意图判定（FR-17.9，不写运行指标）。"""
+    owns_client = client is None
+    http = client or httpx.Client(timeout=15.0)
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        response = http.post(
+            f"{url.rstrip('/')}/api/intents/test",
+            json={"text": text, "lang": lang},
+            headers=headers,
+        )
         response.raise_for_status()
         return dict(response.json())
     finally:
@@ -234,7 +293,7 @@ def _format_selfcheck(report: dict[str, Any]) -> str:
 
 
 def run_doctor(strict: bool = False, json_output: bool = False) -> int:
-    """`robotchat doctor`：构建运行时并执行 18 项自检（T-7.5 / C-123）。
+    """`robotchat doctor`：构建运行时并执行 19 项自检（T-7.5 / C-123）。
 
     FAIL 默认不阻断（服务仍可降级启动）；`--strict` 时以非零码退出，供 CI / 装机脚本使用。
     """
@@ -307,10 +366,34 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(export_result, ensure_ascii=False, indent=2))
         return 0 if export_result.get("ok") else 1
 
+    # 意图诊断（FR-17）：list 只读配置；test 走运行中服务的试跑接口
+    if args.group == "intent":
+        if args.command == "list":
+            try:
+                listing = intent_list()
+            except ConfigError as exc:
+                print(f"配置校验失败：\n{exc}", file=sys.stderr)
+                return 2
+            print(json.dumps(listing, ensure_ascii=False, indent=2))
+            return 0
+        token = args.token or os.environ.get("ROBOTCHAT_API_TOKEN", "")
+        try:
+            test_result = intent_test(
+                text=args.text, lang=args.lang, url=args.url, token=token
+            )
+        except Exception as exc:
+            print(
+                json.dumps({"ok": False, "detail": repr(exc)}, ensure_ascii=False),
+                file=sys.stderr,
+            )
+            return 1
+        print(json.dumps(test_result, ensure_ascii=False, indent=2))
+        return 0 if test_result.get("tested") else 1
+
     load_drivers()
     configure_logging(level="INFO", json_output=False)
 
-    # 启动自检（T-7.5）：自行构建运行时并输出 18 项结论，不进入服务进程
+    # 启动自检（T-7.5）：自行构建运行时并输出 19 项结论，不进入服务进程
     if args.group == "doctor":
         return run_doctor(strict=args.strict, json_output=args.json)
 

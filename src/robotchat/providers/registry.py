@@ -36,6 +36,7 @@ PROVIDER_KINDS = (
     "memory",
     "transport",
     "tool_adapter",
+    "intent",
 )
 
 _REGISTRY: dict[str, dict[str, Callable[..., Any]]] = {}

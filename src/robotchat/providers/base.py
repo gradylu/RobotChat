@@ -223,3 +223,57 @@ class MemoryStore(Protocol):
     async def clear(self, session_id: str) -> None: ...
 
     async def health(self) -> HealthStatus: ...
+
+
+# ---------------------------------------------------------------- 意图识别（R14 / FR-17）
+
+
+@dataclass(frozen=True, slots=True)
+class IntentCapabilities:
+    """意图分类驱动的能力声明；intents 来自 config/intent.yaml（C-178）。"""
+
+    intents: frozenset[str] = frozenset({"chat"})
+    supports_slots: bool = False
+    hot_swap: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class IntentRequest:
+    """意图分类请求：只收文本，不传音频（FR-17.10）。"""
+
+    text: str
+    lang: str = "zh"
+    candidates: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class IntentResult:
+    """一次意图判定结论；`source` 标记 rule（快速路径）或 llm（语义分类）。"""
+
+    intent: str
+    confidence: float = 0.0
+    slots: dict[str, Any] = field(default_factory=dict)
+    source: Literal["rule", "model", "llm"] = "llm"
+    latency_ms: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "confidence": round(self.confidence, 4),
+            "slots": dict(self.slots),
+            "source": self.source,
+            "latency_ms": round(self.latency_ms, 2),
+        }
+
+
+class IntentProvider(Protocol):
+    """语义分类驱动契约：可插拔、走 registry 槽位熔断（§7.5）。"""
+
+    name: str
+    capabilities: IntentCapabilities
+
+    async def classify(
+        self, req: IntentRequest, cancel: CancellationToken | None
+    ) -> IntentResult: ...
+
+    async def health(self) -> HealthStatus: ...

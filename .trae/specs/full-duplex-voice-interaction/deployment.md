@@ -1,8 +1,9 @@
 # RobotChat 全双工语音交互系统 — 部署与运维方案
 
-- 文档版本：v2.0
-- 日期：2026-09-23
+- 文档版本：v2.1
+- 日期：2026-11-01
 - 状态：待评审
+- 变更（v2.1）：新增意图识别与路由的配置、自检、诊断命令、指标与调参项（R14、FR-17、A12），见 §6.2、§7.3、§8、§9.2、§15
 - 定位：本文档回答「**怎么部署、怎么运维**」。需求见 [requirements.md](./requirements.md)，技术设计见 [design.md](./design.md)，验收见 [checklist.md](./checklist.md)
 
 ---
@@ -77,7 +78,7 @@
 | 编排 | `deploy/docker-compose.yml` | 主服务编排 |
 | 编排 | `deploy/docker-compose.models.yml` | 本体语音模型服务编排（可选；LLM / 知识库不在此文件） |
 | 服务 | `deploy/systemd/robotchat.service` | 开机自启与故障重启 |
-| 配置 | `config/app.yaml` `config/providers.yaml`（含 `wakeword` 段）`config/tools.yaml` | 配置模板 |
+| 配置 | `config/app.yaml` `config/providers.yaml`（含 `wakeword` 段）`config/intent.yaml`（意图集合 / 阈值 / 分类超时）`config/tools.yaml` | 配置模板 |
 | 配置 | `config/devices/*.yaml` | **机型 Profile 模板**（采集 / 播放话题、消息类型、采样率、停播方式，FR-16） |
 | 资产 | `assets/wakeword/*.onnx` `assets/sfx/*.wav` | 唤醒词模型与提示音，随镜像打包（更换唤醒词时替换） |
 | 配置 | `deploy/.env.example` | 环境变量模板（含密钥占位） |
@@ -162,6 +163,7 @@
 | VAD / AEC / KWS | 语音活动检测、回声消除、唤醒 | **机器人本体** | — | 应用进程内（ONNX / NumPy，无独立容器） |
 
 > 方言模型与多语言音色一律**不进应用镜像**（CON-8、ADR-13）。启动自检会探测每种已启用语言的 ASR / TTS 可用性（见 §7.3 第 15 项），以及边端 / 云端 LLM 与知识库连通性（第 17 项）。
+> **意图识别不新增独立服务**：语义分类复用 LLM 服务（`intent.active=llm_intent`，与对话 LLM 共用 `LLM_BASE_URL`），仅按 200ms 分类超时与独立请求参数调用；规则快速路径在应用进程内执行（FR-17、design §9.6）。若现场改用本地轻量分类器，模型须满足 CON-1 轻量化约束（不进重型框架）。
 > 本体只承担语音模型；若某机型算力充裕并选择拓扑 2，LLM 才可放本机，且须重新核算资源（§12.1）。
 
 ### 4.2 编排示例（本体语音模型，拓扑 1）
@@ -344,6 +346,12 @@ ROBOTCHAT__PROVIDERS__WAKEWORD__DRIVERS__OPENWAKEWORD__THRESHOLD=0.6
 ROBOTCHAT__LANGUAGE__MODE=auto
 ROBOTCHAT__LANGUAGE__FALLBACK=zh
 
+# 意图识别与路由（A12 已确认：默认 6 类意图，规则快速路径 + 可插拔分类驱动）
+ROBOTCHAT__INTENT__ENABLED=true
+ROBOTCHAT__INTENT__CONFIDENCE_THRESHOLD=0.6      # 低于阈值一律按 chat，禁止误触发 command（FR-17.4）
+ROBOTCHAT__INTENT__CLASSIFY_TIMEOUT_MS=200        # 语义分类超时，超时兜底 chat（FR-17.3）
+ROBOTCHAT__INTENT__ACTIVE=llm_intent              # llm_intent | local_classifier | rule
+
 # 音频设备（A1/A2 已确认：各机型接口不同，靠 Profile 适配）
 # Profile 部署层用简名 ROBOTCHAT_DEVICE_PROFILE（见 §5.2）；compose 映射为 ROBOTCHAT__AUDIO__DEVICE_PROFILE
 ROBOTCHAT__AUDIO__TRANSPORT=ros2_native
@@ -430,6 +438,7 @@ T+30s   WebUI 可访问，语音交互可用
 | 16 | 设备 Profile 与音频接口连通：Profile 是否加载、`ros_distro` 与镜像标签是否一致、声明的话题 / 服务是否真实存在、采集是否有数据、播放是否可 flush | FAIL | 机型不匹配或 Profile 缺失时拒绝就绪，提示运行 `cli audio devices` / `cli audio profile-test` |
 | 17 | 边端 / 云端 LLM 与知识库连通：`LLM_BASE_URL` 可达、首 token 时延达标、`KB_BASE_URL` 可达（或已关闭） | WARN（默认）；`llm.required=true` 时 LLM 为 FAIL | LLM 不可达默认进入 DEGRADED 并播报兜底话术，不拒绝就绪；仅显式要求 LLM 时拒绝就绪；KB 不可达允许启动但跳过增强并告警（ADR-17） |
 | 18 | AEC 模式确认：`audio.aec.mode=auto` 时的实际选择结果（hardware / software）、样本回声衰减是否达标 | WARN | 无硬件 AEC 且软件 AEC 未生效时给出明确提示与调参建议（CON-13） |
+| 19 | 意图集合与分类驱动校验：`config/intent.yaml` schema、意图集合非空且含 `chat`、阈值与超时合法、`intent.active` 驱动可加载（`llm_intent` 复用 LLM 连通性） | WARN | 意图识别降级：语义分类失败按 `chat` 处理并 WARN，`stop` / `confirm` / `cancel` 规则路径仍生效；提示运行 `cli intent test`（FR-17.8） |
 
 > 判定语义：`FAIL` 表示该子系统不可用——除标注「阻塞启动 / 拒绝就绪」外，服务进入 `DEGRADED` 继续运行；`WARN` 表示可降级运行。只有配置显式声明 `required` 时才以 `FAIL` 阻塞就绪（对应 FR-13.11 / NFR-2 的降级要求）。
 
@@ -487,6 +496,8 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 | 唤醒状态与活跃窗口 | `... cli wake status` |
 | 语言能力列表 | `... cli language list` |
 | 语言识别测试（指定语言采样） | `... cli language test --lang yue --seconds 10` |
+| 意图集合与阈值查看 | `... cli intent list` |
+| 意图分类试运行（文本回归 / 现场标定） | `... cli intent test --text "去 A 点" --show-slots` |
 | 会话强制复位 | `... cli session reset --session-id default` |
 | 查看当前状态 | `... cli state` |
 | 导出诊断包 | `... cli diagnose export --out /tmp/robotchat-diag.tar.gz` |
@@ -602,6 +613,18 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
   ├─ 仍误触发 → 抬高 `barge_in.threshold_boost_db` / 延长 `guard_ms` / 打开语义回声剔除
   └─ 极端噪声 → 临时 `barge_in.mode=disabled`（半双工）兜底
 
+【现象】说「停一下」没停 / 控制指令没执行（意图路由异常）
+  ├─ 自检第 19 项（意图集合与分类驱动）是否 PASS
+  │    ├─ WARN / FAIL → 检查 config/intent.yaml 是否被误改（意图集合缺失、阈值 / 超时非法）
+  │    └─ PASS → 继续
+  ├─ 查看 /api/sessions/{id}/turns 的 intent / intent_confidence / intent_source
+  │    ├─ source=rule 却未命中 → 检查 stop / confirm / cancel 规则词表是否覆盖现场说法（方言需按 C-183 扩展）
+  │    ├─ confidence 低于阈值 → 见下一条；可临时下调阈值或补充示例话术（D15）
+  │    └─ 分类超时（intent_late_route_count 增长）→ 检查 LLM 侧负载与 classify_timeout_ms
+  ├─ 确认类指令（「确认」/「取消」）不生效 → 确认是否处于工具确认窗口内（窗口外按 chat 处理，属预期）
+  ├─ 意图被降级为 chat → 查日志 intent_fallback 与 intent_fallback_count，确认分类驱动是否熔断
+  └─ `cli intent test --text "<现场话术>"` 逐句复现，核对 intent / source / latency_ms
+
 【现象】LLM / 知识库不可达（自检第 17 项 FAIL / WARN）
   ├─ `LLM_BASE_URL` 不可达 → 检查边端服务是否启动、网络与端口、鉴权头
   │    ├─ 边端故障 → 切云端 fallback（`providers.llm.fallback`），并确认熔断已生效
@@ -646,6 +669,8 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 | `wakeword.standby.announce` | false | — | 置 true 可待机直接播报任务结果，但为半双工、不支持 Barge-in（FR-14.16） |
 | `wakeword.open_ear.cloud_asr_ack` | false | — | 仅当关闭唤醒词且强需云端 ASR 时置 true；未置位时配置校验 FAIL（默认本地 ASR，FR-14.8） |
 | `tools.confirm_timeout_ms` | 10000 | 给用户更多确认时间，高风险操作等待更久 | 确认更快结束；超时/无法判定按取消处理、不执行（FR-9.10） |
+| `intent.confidence_threshold` | 0.6 | 误触发 `command` 减少，但更多指令被当作闲聊 | `command` 更易触发，误动作风险升高（FR-17.4、C-180） |
+| `intent.classify_timeout_ms` | 200 | 分类更可能等到结果，但首响与路由更晚 | 首响更稳，更多轮次兜底 `chat`（FR-17.3、C-184） |
 
 > 调参建议：每次只改一个参数，改后在真实场景下做 20 次打断测试并查看 WebUI 指标，确认效果后再调下一个。
 
@@ -675,6 +700,7 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 | 业务 | 会话数、轮次数、工具调用次数与成功率 |
 | 唤醒 | 唤醒次数、误唤醒次数（活跃期内无指令超时折算）、唤醒延迟（命中→反馈开始）、活跃窗口到期次数 |
 | 语言 | 各语言 ASR 成功率、语言切换次数（`language_switch_count`）、降级次数（`language_fallback_count`）、TTS 音色降级次数（`tts_fallback_count`） |
+| 意图 | 意图分布（`intent_distribution`）、低置信度占比（`intent_low_confidence_ratio`）、分类降级次数（`intent_fallback_count`）、快速路径与语义分类耗时（`intent_latency_ms`，按 `rule` / `classify`）、`command` 晚到未路由次数（`intent_late_route_count`） |
 
 ### 9.3 告警规则建议
 
@@ -689,6 +715,7 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 | 警告 | 磁盘水位 ≥ 80% | 关注日志增长 |
 | 警告 | 队列丢弃计数增长 | 排查处理能力瓶颈 |
 | 警告 | 唤醒误报率偏高（误唤醒 / 唤醒次数 > 20%，且样本 ≥ 20） | 提高阈值、加冷却、或更换唤醒词 |
+| 警告 | 意图降级率偏高（`intent_fallback_count` / 轮次数 > 10%）或低置信度占比 > 30%（样本 ≥ 50） | 检查 LLM 负载与分类超时；按 D15 重新标定阈值与示例话术 |
 
 ### 9.4 指标暴露
 
@@ -797,7 +824,7 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 
 ## 14. 部署验收
 
-部署相关验收项见 [checklist.md](./checklist.md) §9（C-110 ~ C-134）、§10（C-140 ~ C-148）、§12（C-160 ~ C-168、C-177，机型适配与首批 5 款机型交付）与 §13（C-169 ~ C-176，算力分层 / AEC / 知识库）。交付前须完成：
+部署相关验收项见 [checklist.md](./checklist.md) §9（C-110 ~ C-134）、§10（C-140 ~ C-148）、§12（C-160 ~ C-168、C-177，机型适配与首批 5 款机型交付）、§13（C-169 ~ C-176，算力分层 / AEC / 知识库）与 §15（C-178 ~ C-186，意图识别与路由）。交付前须完成：
 
 - 一键部署脚本在干净环境（仅含 Docker 的机器人本体）验证通过；
 - 启动自检全部 PASS（或 WARN 项有明确说明），含唤醒词模型加载项；
@@ -806,7 +833,8 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 - 资源限制生效，机器人其他业务不受影响；
 - ROS2 既有节点功能未被破坏；
 - 待机态唤醒可用且误唤醒率在验收阈值内（见 checklist §10）；
-- 中英双语与 5 种方言按 checklist §11 验收通过，未支持的方言降级路径有明确提示。
+- 中英双语与 5 种方言按 checklist §11 验收通过，未支持的方言降级路径有明确提示；
+- 意图分类可用（`cli intent test` 覆盖 chat / knowledge / command），低置信度与窗口外 `confirm` / `cancel` 不触发控制，`stop` 停播 ≤ 300ms（见 checklist §15）。
 
 ---
 
@@ -828,3 +856,4 @@ RESULT: DEGRADED (1 FAIL, 2 WARN) — 服务已启动，语音功能不可用
 | D12 | ~~首批需适配的机型清单~~ **已确认（A11，2026-11-01）：智元灵犀 X2 Pro 探索版 / X2 Ultra 旗舰版 / 智元 A2 / 智元 A3 / 宇树 G1，共 5 款**；各机型音频接口契约（麦克风话题名 / 消息类型 / 字段、扬声器播放方式（topic / service / action）、停播方式、采样率 / 声道 / 位深、时间戳来源、ROS2 发行版）仍需逐机型现场采集 | 决定 `config/devices/*.yaml` 内容与适配器实现范围（FR-16.2、FR-16.12）；未采集契约的机型不得以猜测值交付 | T-1A.1 ~ T-1A.4、T-1A.7 |
 | D13 | 首批 5 款机型（同 D12 清单）的本体算力实测：可用 CPU 核数、内存余量、是否具备 GPU / NPU；ASR / TTS / VAD / AEC / KWS 同时驻留的实测占用 | 决定本体资源预算与是否需云端兜底、是否需要空闲卸载（A5、NFR-3、R22）；须逐机型记录，不得跨机型套用 | T-2.11、T-7.3 |
 | D14 | 边端 / 云端 LLM 与知识库服务契约：地址、模型名、鉴权方式、上下文窗口、是否 OpenAI 兼容、知识库检索接口与返回格式 | 决定 provider 配置与 RAG 驱动实现（ADR-17、FR-4.7） | T-2.11、T-5.12 |
+| D15 | **业务意图清单与示例话术、`intent.confidence_threshold` 现场标定**（A12 默认 6 类意图；现场可能需扩展意图、补充方言说法、调整阈值与分类超时） | 决定 `config/intent.yaml` 内容与验收基线（C-179 分类准确率、C-180 低置信度兜底）；标定缺失时误触发 / 漏执行风险上升 | T-1B.2、T-1B.4、T-1B.7 |

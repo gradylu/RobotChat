@@ -1,8 +1,9 @@
 # RobotChat 全双工语音交互系统 — 技术设计
 
-- 文档版本：v2.0
-- 日期：2026-09-23
+- 文档版本：v2.1
+- 日期：2026-11-01
 - 状态：待评审
+- 变更（v2.1）：新增意图识别与路由设计（R14、FR-17、NFR-1、A12），见 §9.6；同步架构、数据流、接口、配置、数据模型、ADR 与风险
 - 定位：本文档回答「**怎么做**」。需求见 [requirements.md](./requirements.md)，部署运维见 [deployment.md](./deployment.md)，验收见 [checklist.md](./checklist.md)
 
 ---
@@ -22,6 +23,7 @@
 | AEC | 硬件优先（Profile 声明）；无硬件时用 NumPy 实现 NLMS 软件方案；`audio.aec.mode` 默认 `auto` 自动选择 | 不引入 scipy / speex 重依赖；A4 确认 AEC 能力因机型而异，必须可配置而非写死（ADR-06、CON-13、§6.2） |
 | 唤醒词 KWS | 默认 openWakeWord（ONNX）+ onnxruntime（CPU），可插拔 | 本地常开、轻量、无商业 License 依赖（ADR-12） |
 | 多语言 / 方言 | 语言能力声明 + 语言路由；本地保 `zh` / `en`，方言走外置或云端方言 ASR | 方言模型体积大，不进镜像（CON-8、ADR-13） |
+| 意图识别与路由 | 本地规则快速路径 + 可插拔语义分类驱动（LLM 结构化输出 / 轻量分类器） | 规则路径 ≤ 20ms 串行前置；语义分类与 LLM / RAG 并行，超时或低置信度兜底 `chat`，不成为首响阻塞项（FR-17、ADR-18） |
 | 音频设备适配 | `AudioDeviceAdapter` 抽象 + 每机型 Profile（配置化）+ 机型适配器实现 | 各机型 ROS2 采集 / 播放接口不同（A1/A2），差异全部收敛到适配层（CON-11、ADR-14） |
 | 容器基础镜像 | `ros:humble-ros-base` / `ros:jazzy-ros-base`（双发行版矩阵） / `python:3.11-slim` + 桥接（备选） | 按 `ROS_DISTRO` 选择标签；见 §3.4、ADR-02、ADR-15 |
 | 编排 | Docker Compose | 单机多容器编排，轻量 |
@@ -56,12 +58,14 @@
 │           ├─ 状态机 StateMachine（声明式转移表 + Guard + 超时兜底）    │
 │           ├─ Turn 管理（turn_id / 陈旧事件丢弃）                       │
 │           ├─ 语言路由 LanguageRouter（lang 判定 + 能力协商 + 降级）     │
+│           ├─ 意图路由 IntentRouter（规则快速路径 + 语义分类并行）        │
 │           ├─ 取消令牌 CancellationToken（父子传播）                    │
 │           └─ 看门狗 Watchdog（状态超时 + 全局心跳）                     │
 ├────────────────────────────────────────────────────────────────────┤
 │  能力层   Provider 注册表（可插拔驱动 + 熔断降级 + 能力协商）           │
 │           ├─ ASR : FunASR 本地 / 云端流式                            │
 │           ├─ LLM : vLLM / Ollama / OpenAI 兼容云端                    │
+│           ├─ Intent : 规则 / LLM 结构化输出 / 轻量分类器（可插拔）        │
 │           └─ TTS : Qwen3-TTS 本地 / 云端                              │
 ├────────────────────────────────────────────────────────────────────┤
 │  音频层   AudioTransport 抽象（容器边界内，通过 DDS 或桥接触达设备）    │
@@ -342,20 +346,29 @@ providers:
                                      ASR 流式会话(热流,不销毁)             │
                                        │ partial / final + lang           │
                                        ▼                                  │
-                        语言路由 + 记忆检索 + 提示词组装                    │
-                                       ▼                                  │
-                                LLM 流式生成 ──▶ 按句切分 ──▶ TTS 流式合成  │
-                                       │                          │       │
-                                   tool call                      ▼       │
-                                       │                     播放队列 ────┘
-                                       ▼                          │
-                              工具执行适配器                       ▼
-                          (ROS2；REST/MQTT 预留)         扬声器 / ROS2
-                                       │
-                                       └──▶ 结果回灌 LLM ──▶ 播报反馈
+                       意图识别与路由 IntentRouter（§9.6）                 │
+                       ├─ 规则快速路径 stop / confirm / cancel（≤20ms）     │
+                       └─ 语义分类 chat / knowledge / command（并行）       │
+                                       │ intent / confidence / slots      │
+                         ┌─────────────┴─────────────┐                    │
+                         ▼                           ▼                    │
+                chat / knowledge                  command                 │
+                         │                           │                    │
+                         ▼                           ▼                    │
+        语言路由 + 记忆检索 + 提示词组装         工具校验 / 二次确认         │
+          （knowledge → RAG 注入）                   │                    │
+                         ▼                           ▼                    │
+                LLM 流式生成                   工具执行适配器（ROS2）        │
+                         │                           │                    │
+                     tool call                       └─▶ 结果回灌 LLM      │
+                         │                           │                    │
+                         ▼                           ▼                    │
+          按句切分 ──▶ TTS 流式合成 ──▶ 播放队列 ──▶ 扬声器 / ROS2         │
 ```
 
 **架构核心**：VAD 与 ASR 采集链路**从不因播报而停止**；播放链路独立并发且可被整体冲刷（flush）。这两点是「边听边说 + 秒打断」的物理基础。
+
+**意图路由不新增状态与链路**：规则快速路径在 `LISTENING → THINKING` 之间串行执行（≤20ms），语义分类与 LLM / RAG 并行；`command` 须在首块音频入队前转为工具路径，`stop` 复用 Barge-in 取消路径，低置信度与窗口外的 `confirm` / `cancel` 一律按 `chat` 处理（§9.6）。
 
 ---
 
@@ -448,6 +461,8 @@ providers:
 | INV-7 | 内部队列有界 | 所有队列由有界队列封装，超限按策略丢弃 + 告警计数 |
 | INV-8 | **会话活跃期内的打断不得以唤醒词为前提** | Barge-in 检测器不依赖 KWS；`ACTIVE_IDLE` / `SPEAKING` 下 KWS 不参与打断判定 |
 | INV-9 | 待机态不持有 ASR 会话；活跃态不运行 KWS | 状态机在 `IDLE` ↔ `ACTIVE_IDLE` 切换时显式启停 ASR 与 KWS 任务，避免资源常驻（关闭唤醒词时按 FR-14.8 常驻 `ACTIVE_IDLE`，属显式配置例外） |
+| INV-10 | 意图判定不得成为首响阻塞项 | 规则快速路径串行 ≤ 20ms；语义分类与 LLM / RAG 并行，超时 200ms 按 `chat` 兜底；分类失败只降级不中断对话（FR-17.3、FR-17.8） |
+| INV-11 | 低置信度与确认窗口外的 `confirm` / `cancel` 不得触发工具 | `confidence < intent.confidence_threshold` 一律路由 `chat`；`confirm` / `cancel` 仅在高风险工具确认窗口内生效（FR-17.4、FR-17.6） |
 
 ### 5.5 状态机实现形态
 
@@ -619,11 +634,20 @@ class WakeWordProvider(Protocol):
 class KwsStream(Protocol):
     async def feed(self, frame: AudioFrame) -> None: ...    # 逐帧喂入，帧长由 capabilities.frame_ms 决定
     async def close(self) -> None: ...
+
+class IntentProvider(Protocol):
+    name: str
+    capabilities: IntentCapabilities       # 意图集合 / 是否支持槽位 / 是否可热切换
+
+    async def classify(self, req: IntentRequest, cancel: CancellationToken) -> IntentResult: ...
+    async def health(self) -> HealthStatus: ...
 ```
 
 > **例外说明**：进程内 ONNX 推理仅限两类——唤醒词（`WakeWordProvider`，2~5 MB）与 VAD（音频算法，非 provider）。二者纯 CPU、待机常开不能容忍网络往返（FR-14.11、ADR-05、ADR-12）；ASR / LLM / TTS 仍严格走网络协议。
 
 > 注意：除唤醒词外的模型 provider（ASR / LLM / TTS）均通过**网络协议**访问外部服务（本地或云端），不做进程内推理 —— 这是 CON-1 轻量化约束在接口层的体现；VAD 属音频算法，与唤醒词同为仅有的进程内 ONNX 例外。
+
+> 意图识别约束（FR-17.10、FR-17.11）：`IntentProvider` 只接收 ASR 文本，不得为分类单独上传或缓存音频；实现可为规则、本地轻量分类器或 LLM 结构化输出。`stop` / `confirm` / `cancel` 的规则快速路径固定为进程内实现（不走网络），其余类别由可插拔驱动分类；驱动失败、超时或不可用时按 `chat` 降级。
 
 ### 7.2 驱动注册与解析
 
@@ -755,6 +779,39 @@ language:
     shanghai: { driver: qwen3_tts_local, voice: "default", fallback_marked: true }
     tianjin: { driver: qwen3_tts_local, voice: "default", fallback_marked: true }
 
+# config/intent.yaml（独立配置文件，支持热更新；FR-17.1 ~ FR-17.12）
+intent:
+  enabled: true
+  confidence_threshold: 0.6         # 低于阈值一律按 chat（FR-17.4）
+  classify_timeout_ms: 200          # 语义分类超时按 chat，不阻塞首响（FR-17.3）
+  gray_zone_top: 0.75               # P2 澄清区间上限（threshold ~ threshold + 0.15，FR-17.12）
+  active: llm_intent                # 语义分类驱动；stop / confirm / cancel 规则快速路径为进程内固定实现
+  intents:                          # 意图集合可增删、可热更新，禁止写死在编排代码（FR-17.2）
+    chat:
+      description: "闲聊与开放问答"
+      examples: ["今天天气怎么样", "给我讲个笑话"]
+    knowledge:
+      description: "知识库 / 领域知识问询"
+      examples: ["充电桩怎么用", "手册里怎么写"]
+    command:
+      description: "机器人控制指令"
+      examples: ["去 A 点", "返回充电桩", "打开夹爪"]
+    confirm:
+      description: "确认（仅高风险工具确认窗口内生效）"
+      examples: ["确认", "好的", "执行吧"]
+    cancel:
+      description: "取消（仅高风险工具确认窗口内生效）"
+      examples: ["取消", "算了", "不用了"]
+    stop:
+      description: "停止播报 / 取消当前任务"
+      examples: ["停一下", "别说了", "停止"]
+  drivers:
+    llm_intent:
+      kind: llm                     # llm | local_classifier | rule；新增实现仅需注册驱动
+      base_url: "${LLM_BASE_URL}"
+      model: "${LLM_MODEL}"
+      supports_slots: true
+
 resilience:
   failure_threshold: 3               # 连续失败次数触发熔断
   cooldown_seconds: 30
@@ -875,6 +932,8 @@ CLOSED ──连续失败达阈值──▶ OPEN ──冷却期满──▶ HAL
 
 知识库**不在本体**（A5、CON-12），应用只做检索调用与提示词注入。
 
+触发条件：`intent=knowledge`（§9.6）时必触发；知识库启用（`knowledge.active != none`）时检索与意图分类并行发起，因此分类结果晚到也不会漏检索。其他意图不额外检索，避免无谓调用与预算占用。
+
 ```
 ASR final ─▶ 知识检索 KnowledgeRetriever (timeout 200ms)
                 │ 命中片段（含来源 / 得分）
@@ -901,17 +960,22 @@ ASR final ─▶ 知识检索 KnowledgeRetriever (timeout 200ms)
 ### 9.1 执行流程
 
 ```
-用户语音 ─▶ ASR final ─▶ LLM(带 tools) ─▶ tool_call(结构化) 
-                                              │
-                                    ┌─────────┴──────────┐
-                                    ▼                    ▼
-                              策略校验（白名单      高风险 → 二次确认播报
-                              / 参数校验/风险分级）         │
-                                    │                    ▼
-                                    └──────────▶ 执行适配器（ROS2；REST/MQTT 预留）
-                                                         │
-                                                         ▼
-                                            结果回灌 LLM ─▶ 自然语言播报
+用户语音 ─▶ ASR final ─▶ 意图识别与路由（§9.6）
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+   chat（默认）         knowledge（RAG）       command（工具）
+        │                     │                     │
+        │             知识检索 / 注入               ▼
+        │                     │          策略校验（白名单 / 参数校验 / 风险分级）
+        │                     │                     │
+        │                     │           高风险 → 二次确认播报
+        │                     │                     │
+        └────────────┬────────┘                     ▼
+                     ▼                   执行适配器（ROS2；REST/MQTT 预留）
+             LLM(带 tools) ──▶ tool_call            │
+                     │                             ▼
+                     └──────────────▶ 结果回灌 LLM ─▶ 自然语言播报
 ```
 
 ### 9.2 工具定义
@@ -951,6 +1015,72 @@ ToolDef(
 - **IoT 设备控制暂不纳入本期范围**（开关、传感器读写等），待具体需求明确后再排期；届时只新增适配器实现与工具定义，不改编排层与状态机。
 - 验收口径：C-87 只验证「新增适配器零改业务代码」的扩展性，不要求 IoT 真实执行。
 
+### 9.6 意图识别与路由（R14、FR-17）
+
+> 目标：ASR final 后先产出结构化意图，再决定 RAG / 工具 / 对话路径。意图识别**不新增状态、不阻塞首响、不成为单点故障**。
+
+#### 9.6.1 意图结果模型与默认集合
+
+| 字段 | 含义 | 约束 |
+| --- | --- | --- |
+| `intent` | 意图标识 | 必须来自 `config/intent.yaml` 的 `intents`，不得在编排代码写死业务枚举（FR-17.1、FR-17.2） |
+| `confidence` | 置信度 0~1 | 低于 `intent.confidence_threshold` 一律按 `chat`（FR-17.4） |
+| `slots` | 槽位 | `command` 至少含工具名与参数；`knowledge` 含检索 query |
+| `source` | `rule` / `model` / `llm` | 规则快速路径记 `rule` |
+| `latency_ms` | 判定耗时 | 快速路径与语义分类分别计量（FR-17.9） |
+
+| 默认意图 | 含义 | 处理路径 | 说明 |
+| --- | --- | --- | --- |
+| `chat` | 闲聊与开放问答 | 常规 LLM 生成 | 低置信度、分类失败、窗口外 `confirm` / `cancel` 的兜底去向 |
+| `knowledge` | 知识库 / 领域知识问询 | 知识检索注入 → LLM | 检索失败 / 超时按 FR-4.7 跳过 |
+| `command` | 机器人控制指令 | 工具校验 → 二次确认 → 执行 | 产出工具名与参数，受 §9.4 白名单 / 参数 / 风险约束 |
+| `confirm` | 确认 | 仅确认窗口内交给确认判定 | 窗口外按 `chat`，不得误触发待执行任务（FR-17.6） |
+| `cancel` | 取消 | 仅确认窗口内交给确认判定 | 同上 |
+| `stop` | 停止播报 / 取消当前任务 | 复用 Barge-in 取消路径 | 立即停播，按策略取消任务（FR-17.6） |
+
+#### 9.6.2 双路径判定与首响预算
+
+| 路径 | 覆盖意图 | 执行方式 | 时延预算 | 失败处理 |
+| --- | --- | --- | --- | --- |
+| 规则快速路径 | `stop` / `confirm` / `cancel` | 进程内关键词与上下文窗口判定 | **≤ 20ms，串行前置，计入首响**（NFR-1） | 未命中视为普通文本，继续语义分类 |
+| 语义分类 | `chat` / `knowledge` / `command` | 可插拔 `IntentProvider`（LLM 结构化输出 / 轻量分类器） | **与 LLM / RAG 并行，不单独累加**；超时 200ms | 超时 / 失败 → `chat` + WARN + 计数（FR-17.3、FR-17.8） |
+
+并行编排（不阻塞首响）：
+
+1. ASR final 到达后先跑规则快速路径（≤ 20ms）。命中 `stop` 立即复用 §6.3 打断序列；`confirm` / `cancel` 仅在 `tools.confirm_window.open=true` 时交给确认判定，否则按 `chat`。
+2. 其余文本同时启动三件事：语义分类任务、RAG 检索（`knowledge.active != none` 时，≤ 200ms）、默认 `chat` 的 LLM 请求准备。RAG 与分类并行；LLM 在检索完成（或跳过）后发出，对应 NFR-1「检索 + 首 token ≤ 800ms」；RAG 关闭时分类与 LLM 请求真正并行。
+3. 分类结果在首块音频入队前返回且为 `command`：取消对话流，按工具路径执行（受 §9.4 校验与二次确认约束）。
+4. 分类结果晚于首块音频：本轮按已在播的 `chat` 完成，记录 `intent_late_route_count`，不中途切换播报；`knowledge` 的检索不受分类时序影响（见第 2 条），晚到结果只影响展示与统计。
+5. 分类结果缺失、超时或低置信度：一律按 `chat`。
+
+#### 9.6.3 路由规则
+
+| 意图 | 路由 | 约束 |
+| --- | --- | --- |
+| `knowledge` | 触发 `KnowledgeRetriever` 并按 FR-4.7 注入提示词 | 检索失败 / 超时跳过并计数 `rag_skipped`，不阻塞对话 |
+| `command` | 工具名 / 参数经白名单、`params_schema`、风险等级校验；高风险先二次确认后执行 | 意图结果与工具校验冲突时**以校验结果为准**（FR-17.5）；未授权工具按 `chat` 并播报拒绝原因 |
+| `chat` | 常规 LLM 生成 | 默认去向；不得把低置信度结果升级为 `command` |
+| `confirm` / `cancel` | 仅在 FR-9.10 确认窗口内生效 | 窗口外按 `chat`；不新建轮次、不取消待执行任务 |
+| `stop` | 立即停播并按策略取消当前任务 | 复用 Barge-in 取消路径（§6.3），不额外增加打断延迟 |
+
+#### 9.6.4 语言与可靠性
+
+- 意图识别使用 ASR 输出的目标语言文本（`zh` / `en` / 方言）；中英混说按主语言处理，不因语言切换丢弃或重复判定（FR-17.7、FR-15）。
+- 分类驱动遵守 §7.5 熔断与能力声明；失败、不可用或超时降级 `chat` 并 WARN，不得中断对话、不得阻塞工具校验；降级次数计入 `intent_fallback_count`（FR-17.8、FR-17.11）。
+- 只使用文本，不得为意图分类单独上传或缓存音频；规则与轻量实现优先，重型模型不得进入应用镜像（FR-17.10、CON-1）。
+
+#### 9.6.5 可观测与 WebUI
+
+- 每轮 `Turn` 记录 `intent` / `confidence` / `source` / `slots` / `latency_ms`（§11）。
+- WebSocket 推送 `intent.detected`；会话面板展示本轮意图、置信度与来源，监控页展示意图分布、低置信度占比、降级次数与两段耗时（FR-17.9、§10）。
+- 指标：`intent_distribution` `intent_low_confidence_ratio` `intent_fallback_count` `intent_latency_ms{path=rule|classify}` `intent_late_route_count`。
+
+#### 9.6.6 可插拔与配置
+
+- 意图集合、示例话术、阈值、驱动全部落在 `config/intent.yaml`，支持热更新；新增意图或驱动只改配置 + 注册实现，**不改状态机与编排**（FR-17.2、FR-17.11）。
+- `stop` / `confirm` / `cancel` 的规则快速路径固定内置；语义分类驱动可在 `llm_intent` / `local_classifier` / `rule` 间切换，具备 capabilities、健康检查与熔断降级（§7.5）。
+- P2：置信度落在灰区（`threshold ~ threshold + 0.15`）时，可先播一句澄清问句并重试，**最多一次**（FR-17.12）。
+
 ---
 
 ## 10. WebUI 与接口设计
@@ -959,12 +1089,12 @@ ToolDef(
 
 | 页面 | 核心内容 |
 | --- | --- |
-| 实时会话 | 状态机状态可视化、**唤醒词命中提示与活跃窗口倒计时**、**当前语种 / 方言标记**、音频活动指示、ASR 流式转写、LLM 流式文本、播报状态、打断事件时间线 |
+| 实时会话 | 状态机状态可视化、**唤醒词命中提示与活跃窗口倒计时**、**当前语种 / 方言标记**、**本轮意图与置信度（含来源与槽位）**、音频活动指示、ASR 流式转写、LLM 流式文本、播报状态、打断事件时间线 |
 | 运行控制 | 开始 / 结束会话、手动打断、麦克风静音、文本输入兜底、**手动唤醒 / 立即休眠**、**语言切换（固定 / 自动）** |
-| 模型配置 | 驱动查看与切换、参数编辑、连通性测试、应用与回滚、密钥来源说明（不显示明文）、**唤醒词模型与阈值 / 冷却期配置**、**语言路由与音色映射配置** |
+| 模型配置 | 驱动查看与切换、参数编辑、连通性测试、应用与回滚、密钥来源说明（不显示明文）、**唤醒词模型与阈值 / 冷却期配置**、**语言路由与音色映射配置**、**意图集合 / 置信度阈值 / 分类超时配置** |
 | 任务与工具 | 工具列表（含风险等级）、调用历史、参数与执行结果 |
 | 记忆管理 | 会话列表、历史消息查看、清除单轮 / 整会话、记忆策略配置 |
-| 监控 | 延迟分位数、打断成功率、错误率、状态流转日志 |
+| 监控 | 延迟分位数、打断成功率、错误率、状态流转日志、**意图分布与低置信度占比** |
 | 运维诊断 | 一键自检、音频回环测试、provider 测试、强制复位、日志导出 |
 
 ### 10.2 WebSocket 事件协议
@@ -983,6 +1113,7 @@ ToolDef(
 | `asr.partial` | `text` `lang` |
 | `asr.final` | `text` `duration_ms` `lang` |
 | `language.changed` | `from` `to` `reason`（`auto` / `manual`） |
+| `intent.detected` | `intent` `confidence` `source`（`rule` / `model` / `llm`）`slots` `latency_ms` |
 | `llm.delta` | `text` |
 | `llm.tool_call` | `name` `args` |
 | `tts.chunk` | `seq` `bytes` `latency_ms`（默认只发元数据，音频不外传） |
@@ -1022,6 +1153,8 @@ ToolDef(
 | GET | `/api/providers` | 驱动列表与 capabilities |
 | GET | `/api/languages` | 支持的语言 / 方言列表与当前生效语言 |
 | POST | `/api/languages/active` | 切换当前语言或语言模式（`fixed` / `auto`） |
+| GET | `/api/intents` | 意图集合、置信度阈值、分类超时与当前生效驱动 |
+| POST | `/api/intents/test` | 意图分类试运行（传入文本，返回 `intent` / `confidence` / `source` / `slots` / `latency_ms`；调试与现场标定用） |
 | POST | `/api/providers/{kind}/switch` | 热切换驱动 |
 | POST | `/api/providers/{kind}/{driver}/test` | 连通性测试 |
 | GET | `/api/tools` | 工具列表（含风险等级） |
@@ -1037,7 +1170,7 @@ ToolDef(
 | 实体 | 关键字段 | 存储 |
 | --- | --- | --- |
 | `Session` | `id` `created_at` `ended_at` `state` `config_snapshot` `turn_count` | SQLite |
-| `Turn` | `id` `session_id` `seq` `lang` `user_text` `asr_partials` `assistant_text` `rag_hits`(doc_id / score / skipped) `status`(`completed`/`interrupted`/`failed`) `timings`(partial / llm_first / tts_first / e2e) `barge_in`(bool) | SQLite |
+| `Turn` | `id` `session_id` `seq` `lang` `user_text` `asr_partials` `intent` `intent_confidence` `intent_source`(`rule`/`model`/`llm`) `intent_slots` `intent_latency_ms` `assistant_text` `rag_hits`(doc_id / score / skipped) `status`(`completed`/`interrupted`/`failed`) `timings`(partial / llm_first / tts_first / e2e) `barge_in`(bool) | SQLite |
 | `Message` | `id` `session_id` `turn_id` `role` `content` `tokens` `created_at` | SQLite / Redis |
 | `ToolCall` | `id` `turn_id` `name` `args` `result` `status` `duration_ms` | SQLite |
 | `MemorySummary` | `session_id` `up_to_turn` `summary_text` | SQLite |
@@ -1059,6 +1192,7 @@ RobotChat/
 ├── config/                      # 配置模板（挂载进容器，不入镜像）
 │   ├── app.yaml                 # 音频、状态机超时、barge-in、AEC 参数
 │   ├── providers.yaml           # 模型厂商驱动配置（含 wakeword 段）
+│   ├── intent.yaml              # 意图集合、置信度阈值、分类超时与意图驱动（§7.3、§9.6）
 │   ├── tools.yaml               # 工具与设备接口映射
 │   └── devices/                 # 机型 Profile（每机型一份，A1/A2、FR-16）
 │       ├── generic_ros_audio.yaml
@@ -1110,11 +1244,13 @@ RobotChat/
 │   │   ├── llm/                 # openai_compat.py（覆盖 vLLM/Ollama/云端）
 │   │   ├── tts/                 # qwen3_tts.py / dashscope_tts.py
 │   │   ├── knowledge/           # http_rag.py（边端 / 云端知识检索，A5）
+│   │   ├── intent/              # llm_intent.py（LLM 结构化输出）/ local_classifier.py，可插拔（§9.6）
 │   │   └── kws/                 # openwakeword.py（进程内 ONNX，唯一例外）
 │   ├── dialog/
 │   │   ├── memory.py            # 多轮记忆（滑窗 + 摘要）
 │   │   ├── rag.py               # 知识检索调度：预算、超时降级、命中追溯（§8.1）
 │   │   ├── language.py          # 语言路由：lang 判定 / 防抖 / 能力协商 / 降级
+│   │   ├── intent.py            # 意图规则快速路径（stop / confirm / cancel）+ 路由与低置信度兜底（§9.6）
 │   │   ├── prompt.py            # 提示词组装（注入 lang 上下文）
 │   │   └── session.py           # 会话生命周期
 │   ├── tools/
@@ -1169,6 +1305,7 @@ RobotChat/
 | ADR-15 | 维护 **Humble + Jazzy 双发行版镜像矩阵**，同一源码分别构建并打标（`-humble` / `-jazzy`） | 满足 A3 与 CON-10：两类机型都要交付，且 Python 版本被发行版锁定 | 单镜像兼容两发行版（Python 与 rclpy 无法同时满足）、仅支持单发行版（覆盖不足） | CI 双构建；代码兼容 3.10 ~ 3.12；启动校验 `ROS_DISTRO` 与镜像标签一致（R21） |
 | ADR-16 | **算力分层**：语音模型（ASR / TTS / VAD / AEC / KWS）**默认**在本体，LLM 与知识库**默认**在边端或云端；本体算力不足或大算力机型可显式改配 | 满足 A5 与 CON-12：语音链路延迟与断网可用性要求最高，必须在本地闭环；LLM 对网络容忍度高且与语音模型抢资源会破坏打断与首响 | 全本地（本体资源不够、OOM 风险高）、全云端（断网不可用、打断与首响不达标） | provider 只改 `base_url` 即可迁移位置；本体须给出资源预算表（NFR-3、R22） |
 | ADR-17 | LLM 与知识库统一采用 **OpenAI 兼容协议 + 可配置 `base_url`**；LLM 默认不在本体内运行 | 同一驱动即可在「边端 / 云端 / 可选本机小模型」之间切换，避免三套实现；边端迁移不改代码 | 为每类位置写一套驱动（维护成本高）、绑定单一厂商（无法替换） | 边端与云端须保持协议兼容；`timeout` 与降级策略按位置分档（NFR-1）；本机 LLM 须显式开启并通过资源校验 |
+| ADR-18 | 意图判定采用**双路径**：`stop` / `confirm` / `cancel` 走进程内规则快速路径（串行前置，≤ 20ms），其余语义分类**与 LLM / RAG 并行**，200ms 超时或低于阈值一律兜底 `chat` | 意图是编排的前置决策，但绝不能成为首响阻塞项（NFR-1）；规则路径保证「说停就停」的确定性，语义分类并行保证准确率 | 全部用 LLM 判定（首响阻塞、`stop` 不可靠）、全部用规则（命令覆盖不足、维护成本高）、串行分类（首响劣化） | 意图集合与阈值外置配置；低置信度与确认窗口外的 `confirm` / `cancel` 一律按 `chat`，禁止误触发工具（INV-10、INV-11）；晚到的 `command` 不追溯执行（R26） |
 
 ---
 
@@ -1200,3 +1337,5 @@ RobotChat/
 | R22 | 本体算力不足：ASR / TTS / VAD / AEC / KWS 同时驻留导致 CPU 打满或 OOM | 首响变慢、打断失效、甚至整机业务受影响 | 部署前实测预算（D13）；模型服务设 cgroup 上限；空闲卸载 ASR / TTS；优先降并发而非降质量；必要时云端 ASR 兜底（ADR-16） |
 | R23 | 边端 / 云端 LLM 网络抖动导致首 token 超时 | 用户等待、轮次频繁降级 | 首 token 超时熔断 + 兜底话术；边端优先、云端兜底；连接复用与预热；按位置分档设置超时（NFR-1、ADR-17） |
 | R24 | 知识库检索注入噪声或恶意片段 | 回答偏离、提示词被劫持 | `max_chars` + 得分截断；片段标注为不可信数据并限定来源边界；超时即跳过；命中可追溯（§8.1） |
+| R25 | 意图误判（把闲聊识别为命令、把命令识别为闲聊） | 误触发机器人动作（安全风险）或该执行未执行（体验落差） | 置信度阈值默认 0.6 且低于阈值一律兜底 `chat`；`command` 仅在高置信度下生效并仍受工具白名单 / 二次确认约束；意图集合与示例话术现场标定（D15）；监控 `intent_distribution` 与 `intent_low_confidence_ratio`；P2 灰区最多一次澄清（§9.6.6） |
+| R26 | 语义分类晚于首块音频入队，`command` 未能生效 | 用户指令被当作闲聊，需再说一遍 | `command` 须在首块音频入队前生效，晚到则按 `chat` 完成本轮并记录 `intent_late_route_count`；分类超时 200ms 与并行编排控制晚到概率；现场标定阈值与超时（§9.6.2、§9.6.5） |

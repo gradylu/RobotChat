@@ -22,6 +22,8 @@ E2E_FIRST_RESPONSE = "e2e_first_response"
 BARGE_IN = "barge_in"                    # 打断响应
 TOOL_EXECUTION = "tool_execution"
 WAKE_LATENCY = "wake_latency_ms"         # 唤醒命中 → 反馈开始播放（FR-14.10）
+INTENT_RULE = "intent_latency_rule"      # 规则快速路径耗时（FR-17，预算 P95 ≤ 20ms）
+INTENT_CLASSIFY = "intent_latency_classify"  # 语义分类耗时（含兜底路径）
 
 # 计数类指标（FR-14.13 / C-148）：不可用分位数表达，单独聚合
 WAKE_COUNT = "wake_count"
@@ -33,6 +35,11 @@ OPEN_EAR_CLOUD_AUDIO = "open_ear_cloud_audio_ms"  # 常开聆听 + 云端 ASR �
 BARGE_IN_ACCEPTED = "barge_in_accepted"
 BARGE_IN_ECHO_SUPPRESSED = "barge_in_echo_suppressed"
 BARGE_IN_REJECTED = "barge_in_rejected"
+# 意图计数（FR-17）：总量 / 低置信度 / 失败兜底 / 分类晚到（首响后补判）
+INTENT_TOTAL = "intent_total"
+INTENT_LOW_CONFIDENCE = "intent_low_confidence"
+INTENT_FALLBACK = "intent_fallback_count"
+INTENT_LATE_ROUTE = "intent_late_route_count"
 
 KNOWN_STAGES = (
     ENDPOINT,
@@ -44,6 +51,8 @@ KNOWN_STAGES = (
     BARGE_IN,
     TOOL_EXECUTION,
     WAKE_LATENCY,
+    INTENT_RULE,
+    INTENT_CLASSIFY,
 )
 
 KNOWN_COUNTERS = (
@@ -55,6 +64,10 @@ KNOWN_COUNTERS = (
     BARGE_IN_ACCEPTED,
     BARGE_IN_ECHO_SUPPRESSED,
     BARGE_IN_REJECTED,
+    INTENT_TOTAL,
+    INTENT_LOW_CONFIDENCE,
+    INTENT_FALLBACK,
+    INTENT_LATE_ROUTE,
 )
 
 

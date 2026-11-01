@@ -34,6 +34,15 @@ from robotchat.core.events import BoundedEventBus, Event, EventType
 from robotchat.core.state_machine import MachineContext, State, StateMachine
 from robotchat.core.turn import TurnManager
 from robotchat.core.watchdog import Watchdog
+from robotchat.dialog.intent import (
+    INTENT_CANCEL,
+    INTENT_COMMAND,
+    INTENT_CONFIRM,
+    INTENT_STOP,
+    IntentCommandRouted,
+    IntentResult,
+    IntentRouter,
+)
 from robotchat.dialog.language import LanguageRouter, VoicePlan
 from robotchat.dialog.prompt import ContextResult, assemble_context, build_system_prompt
 from robotchat.dialog.rag import RagOutcome, RagService
@@ -47,6 +56,7 @@ from robotchat.observability.metrics import (
     BARGE_IN_ECHO_SUPPRESSED,
     BARGE_IN_REJECTED,
     E2E_FIRST_RESPONSE,
+    INTENT_LATE_ROUTE,
     LLM_FIRST_TOKEN,
     OPEN_EAR_CLOUD_AUDIO,
     STANDBY_RESULT_CACHED,
@@ -228,6 +238,15 @@ class DialogTurn:
     spoken_ratio: float = 0.0
     barge_in_stages: dict[str, float] = field(default_factory=dict)
     finished: bool = False
+    # 意图识别（FR-17 / R14）：intent 记录最终生效意图（含窗口外兜底 chat）
+    intent: str = ""
+    intent_confidence: float = 0.0
+    intent_source: str = ""
+    intent_slots: dict[str, Any] = field(default_factory=dict)
+    intent_latency_ms: float = 0.0
+    # 与 LLM / RAG 并行的语义分类任务（INV-10：意图不阻塞首响）
+    classify_task: asyncio.Task[IntentResult] | None = None
+    classify_started_at: float = 0.0
 
 
 UIEventSink = Callable[[str, dict[str, Any], int | None], Awaitable[None] | None]
@@ -254,6 +273,7 @@ class DialogOrchestrator:
         ui_sink: UIEventSink | None = None,
         event_bus: BoundedEventBus | None = None,
         aec_mode: str = "software",
+        intent_router: IntentRouter | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -267,6 +287,7 @@ class DialogOrchestrator:
         self._transport = transport
         self._vad = vad
         self._providers: dict[str, Any] = dict(providers or {})
+        self.intent_router = intent_router
 
         self.context = MachineContext(
             wakeword_enabled=settings.providers.wakeword.enabled
@@ -831,6 +852,8 @@ class DialogOrchestrator:
                 turn_id,
             )
         await self._handle(Event(EventType.EV_ASR_FINAL, turn_id, self.session_id), turn)
+        if await self._route_intent_fast_path(turn):
+            return
         self._start_turn_task(turn)
 
     async def _close_asr(self) -> None:
@@ -847,12 +870,219 @@ class DialogOrchestrator:
             with contextlib.suppress(Exception):
                 await stream.close()
 
+    # ------------------------------------------------------------ 意图识别与路由（FR-17 / R14）
+
+    async def _route_intent_fast_path(self, turn: DialogTurn) -> bool:
+        """ASR final 后的规则快速路径：stop / confirm / cancel 零预算前置（FR-17）。
+
+        返回 True 表示意图已就地消化（打断 / 确认判定），不再进入 LLM 对话链路；
+        返回 False 交由并行语义分类与正常对话继续（INV-10：意图不阻塞首响）。
+        """
+        router = self.intent_router
+        if router is None or not router.enabled or not turn.user_text.strip():
+            return False
+        result = router.fast_path(turn.user_text, turn.lang)
+        if result is None:
+            return False
+        routed = router.route(result, confirm_window_open=self._confirming)
+        self._note_intent(turn, result, routed)
+        await self._emit_intent_detected(turn, result, routed)
+        if routed == INTENT_STOP:
+            # 语义打断复用 barge-in 取消路径（C-07）：无可打断对象时就地消化
+            self.metrics.increment(BARGE_IN_ACCEPTED)
+            decision = BargeInDecision(
+                accepted=True,
+                trigger="semantic",
+                reason="intent_stop",
+                text=turn.user_text,
+            )
+            if self.machine.state in (State.THINKING, State.SPEAKING, State.EXECUTING):
+                await self._on_barge_in(decision)
+            else:
+                turn.status = "completed"
+                self._finish_turn(turn)
+                self._begin_turn("")
+            return True
+        if routed in (INTENT_CONFIRM, INTENT_CANCEL) and self._confirming:
+            self._resolve_confirm(routed == INTENT_CONFIRM)
+            return True
+        return False
+
+    def _note_intent(self, turn: DialogTurn, result: IntentResult, routed: str) -> None:
+        """登记本轮意图结论并累计分布计数（动态键，不进 KNOWN_COUNTERS）。"""
+        turn.intent = routed
+        turn.intent_confidence = result.confidence
+        turn.intent_source = result.source
+        turn.intent_slots = dict(result.slots)
+        turn.intent_latency_ms = result.latency_ms
+        self.metrics.increment(f"intent_distribution:{routed}")
+
+    async def _emit_intent_detected(
+        self, turn: DialogTurn, result: IntentResult, routed: str
+    ) -> None:
+        payload = {"turn_id": turn.turn_id, "routed": routed, **result.as_dict()}
+        await self._emit_ui("intent.detected", payload, turn.turn_id)
+
+    def _start_intent_classify(
+        self, turn: DialogTurn, token: CancellationToken
+    ) -> asyncio.Task[IntentResult] | None:
+        """语义分类与 LLM / RAG 并行启动（FR-17）；快速路径已定论则跳过。"""
+        router = self.intent_router
+        if router is None or not router.enabled or turn.intent:
+            return None
+        turn.classify_started_at = self._clock()
+
+        async def _run() -> IntentResult:
+            return await router.classify(turn.user_text, turn.lang, cancel=token)
+
+        task = asyncio.create_task(_run(), name=f"intent-classify-{turn.turn_id}")
+        turn.classify_task = task
+        return task
+
+    async def _gate_intent_command(
+        self, turn: DialogTurn, queue: asyncio.Queue[str | None]
+    ) -> None:
+        """首块音频出声前回收意图结论；command 则中止对话流转工具执行（INV-10）。
+
+        超时 / 未定论一律按 chat 放行（intent_late_route_count），不阻塞首响。
+        """
+        task = turn.classify_task
+        turn.classify_task = None
+        router = self.intent_router
+        if task is None or router is None:
+            return
+        result: IntentResult | None = None
+        if task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                result = task.result()
+        else:
+            budget_s = router.settings.classify_timeout_ms / 1000.0
+            remaining = budget_s - (self._clock() - turn.classify_started_at)
+            if remaining <= 0:
+                self.metrics.increment(INTENT_LATE_ROUTE)
+                await _cancel_task(task)
+                return
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.TimeoutError:
+                self.metrics.increment(INTENT_LATE_ROUTE)
+                await _cancel_task(task)
+                return
+        if result is None:
+            return
+        routed = router.route(result, confirm_window_open=self._confirming)
+        self._note_intent(turn, result, routed)
+        await self._emit_intent_detected(turn, result, routed)
+        if routed == INTENT_COMMAND and str(result.slots.get("tool") or "").strip():
+            raise IntentCommandRouted(result)
+
+    async def _execute_intent_command(
+        self,
+        turn: DialogTurn,
+        token: CancellationToken,
+        result: IntentResult,
+        queue: asyncio.Queue[str | None],
+        tts_task: asyncio.Task[Any],
+    ) -> None:
+        """意图 command 命中：绕过 LLM 回复，直接派发工具并播报结论（FR-17 / R14）。"""
+        del token  # 执行层复用工具注册表自身的校验与超时控制
+        turn.assistant_text = ""
+        tool = str(result.slots.get("tool") or "").strip()
+        raw_args = result.slots.get("arguments")
+        args = dict(raw_args) if isinstance(raw_args, dict) else {}
+        call = ToolCall(
+            id=f"intent-{turn.turn_id}-{tool}", name=tool, args=args, turn_id=turn.turn_id
+        )
+        await self._emit_ui(
+            "llm.tool_call", {"id": call.id, "name": call.name, "args": call.args}, turn.turn_id
+        )
+        definition = None
+        decision = None
+        tools = self.tools
+        if tools is not None:
+            definition, decision = tools.check(call)
+        if tools is None or definition is None or decision is None or not decision.allowed:
+            reason = decision.reason if decision is not None else f"未知工具 {tool}"
+            await self._record_tool_result(
+                turn, call, ToolResult(ok=False, error=reason, error_kind="denied")
+            )
+            await self._speak_intent_feedback(turn, queue, tts_task, f"该功能暂不可用：{reason}")
+            return
+        if decision.needs_confirm and not await self._confirm_tool(turn, call, definition):
+            await self._record_tool_result(
+                turn,
+                call,
+                ToolResult(ok=False, error="未确认或确认超时，已取消执行", error_kind="cancelled"),
+            )
+            await self._speak_intent_feedback(turn, queue, tts_task, "好的，已取消。")
+            return
+        if definition.timeout_s > self.settings.tools.async_threshold_s:
+            # 长任务移交执行层，对话继续（T-5.9 / C-83）
+            self._dispatch_async_tool(turn, call)
+            await self._speak_intent_feedback(
+                turn, queue, tts_task, "好的，正在执行，完成后告诉你。"
+            )
+            return
+        if self.machine.state == State.THINKING:
+            await self._handle(
+                Event(EventType.EV_LLM_TOOL_CALL, turn.turn_id, self.session_id), turn
+            )
+        started = self._clock()
+        tool_result = await tools.invoke(call, None, turn_id=turn.turn_id, checked=True)
+        self.metrics.record(TOOL_EXECUTION, _ms(self._clock() - started))
+        if self.machine.state == State.EXECUTING:
+            event_type = (
+                EventType.EV_TOOL_TIMEOUT
+                if tool_result.error_kind == "timeout"
+                else EventType.EV_TOOL_ERROR
+                if not tool_result.ok
+                else EventType.EV_TOOL_DONE
+            )
+            await self._handle(Event(event_type, turn.turn_id, self.session_id), turn)
+        await self._record_tool_result(turn, call, tool_result)
+        if tool_result.ok:
+            feedback = "好的，已完成。"
+        else:
+            feedback = f"抱歉，执行失败：{tool_result.error or '未知错误'}。"
+        await self._speak_intent_feedback(turn, queue, tts_task, feedback)
+
+    async def _speak_intent_feedback(
+        self,
+        turn: DialogTurn,
+        queue: asyncio.Queue[str | None],
+        tts_task: asyncio.Task[Any],
+        text: str,
+    ) -> None:
+        """命令结果播报：复用既有 TTS 队列，不另起链路；TTS 已失效则只留文本。"""
+        turn.assistant_text += text
+        if tts_task.done():
+            with contextlib.suppress(Exception):
+                await tts_task
+            return
+        await self._enqueue_sentence(turn, queue, text)
+        await queue.put(None)
+        await tts_task
+
+    async def reload_intent(self) -> dict[str, Any]:
+        """按最新 `intent` 配置重建意图路由（配置热更新用，T-6.3）。"""
+        if self.intent_router is None:
+            return {"enabled": False}
+        self.intent_router.apply_settings(self.settings)
+        snapshot = self.intent_router.snapshot()
+        await self._emit_ui("intent.updated", snapshot, None)
+        return snapshot
+
     # ------------------------------------------------------------ 打断（T-4.1 ~ T-4.6）
 
     async def _enqueue_sentence(
         self, turn: DialogTurn, queue: asyncio.Queue[str | None], sentence: str
     ) -> None:
-        """句子入播放队列，并登记为「已送入播放队列」的文本（FR-6.8 / T-4.5）。"""
+        """句子入播放队列，并登记为「已送入播放队列」的文本（FR-6.8 / T-4.5）。
+
+        首句入队前先回收意图结论：command 命中则在此中止（INV-10 / FR-17）。
+        """
+        if not turn.spoken_fragments:
+            await self._gate_intent_command(turn, queue)
         await queue.put(sentence)
         turn.spoken_fragments.append(sentence)
         self.barge.note_spoken_text(sentence)
@@ -1352,6 +1582,9 @@ class DialogOrchestrator:
         if llm is None:
             raise RuntimeError("LLM 驱动不可用")
 
+        # 语义分类与 RAG / LLM 并行（FR-17）；结论在首块音频出声前回收（INV-10）
+        self._start_intent_classify(turn, token)
+
         rag_outcome = RagOutcome(reason="disabled")
         if self.rag is not None:
             rag_outcome = await self.rag.retrieve(turn.user_text, token)
@@ -1388,6 +1621,7 @@ class DialogOrchestrator:
         started = self._clock()
         first_token = False
 
+        command_routed: IntentCommandRouted | None = None
         try:
             rounds = 0
             while True:
@@ -1422,12 +1656,20 @@ class DialogOrchestrator:
                 await self._enqueue_sentence(turn, queue, sentence)
             await queue.put(None)
             await tts_task
+        except IntentCommandRouted as exc:
+            # 意图 command 命中：保留 TTS 消费任务，转直接工具执行（FR-17）
+            command_routed = exc
         except asyncio.CancelledError:
             await _cancel_task(tts_task)
             raise
         except Exception:
             await _cancel_task(tts_task)
             raise
+
+        if command_routed is not None:
+            await self._execute_intent_command(
+                turn, token, command_routed.result, queue, tts_task
+            )
 
         if not first_token and self.machine.state == State.THINKING:
             # 工具轮次可能没有任何文本输出：补首 token 事件，避免状态机停在 THINKING
@@ -1680,9 +1922,21 @@ class DialogOrchestrator:
         if not answer:
             # 无法判定按取消处理（FR-9.10），避免误执行高风险动作
             logger.info("tool_confirm_unrecognized", text=text)
+        # 意图快速路径仅作观测补充（FR-17）：policy 判定仍是唯一依据
+        intent_note = ""
+        router = self.intent_router
+        if router is not None and router.enabled:
+            fast = router.fast_path(text, event.lang)
+            if fast is not None:
+                intent_note = router.route(fast, confirm_window_open=True)
         await self._emit_ui(
             "tool.confirm.heard",
-            {"text": text, "answer": answer or "unknown", "confirmed": confirmed},
+            {
+                "text": text,
+                "answer": answer or "unknown",
+                "confirmed": confirmed,
+                "intent": intent_note or "unknown",
+            },
             self.turns.current_turn_id,
         )
         self._resolve_confirm(confirmed)
@@ -1789,6 +2043,11 @@ class DialogOrchestrator:
         if turn.finished:
             return
         turn.finished = True
+        # 未定论的并行分类任务随轮次终止（FR-17）
+        classify_task = turn.classify_task
+        turn.classify_task = None
+        if classify_task is not None and not classify_task.done():
+            classify_task.cancel()
         interrupted = turn.status == "interrupted"
         total_chars = len(turn.assistant_text)
         # 已送入播放队列的文本片段：打断时只归档这部分（T-4.5 / FR-6.8）
@@ -1821,6 +2080,11 @@ class DialogOrchestrator:
             tts_lang=turn.tts_lang or turn.lang,
             tts_fallback=turn.tts_fallback,
             spoken_ratio=turn.spoken_ratio,
+            intent=turn.intent,
+            intent_confidence=turn.intent_confidence,
+            intent_source=turn.intent_source,
+            intent_slots=turn.intent_slots,
+            intent_latency_ms=turn.intent_latency_ms,
         )
         if turn.user_text:
             self._history.append(ChatMessage(role="user", content=turn.user_text))
@@ -2084,6 +2348,11 @@ class DialogOrchestrator:
             "background_tasks": len(self._background_tasks),
             "errors": self.error_count,
             "language": self.language.snapshot(),
+            "intent": (
+                self.intent_router.snapshot()
+                if self.intent_router is not None
+                else {"enabled": False}
+            ),
             "wake": self.wake_snapshot(),
             "barge_in": self.barge_in_snapshot(),
             "memory": self.memory_snapshot(),

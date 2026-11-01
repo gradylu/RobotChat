@@ -99,6 +99,12 @@ class SessionStore:
             "tts_fallback": "INTEGER NOT NULL DEFAULT 0",
             # 打断轮次的已播报比例（FR-6.8 / C-72）
             "spoken_ratio": "REAL NOT NULL DEFAULT 0",
+            # 意图识别落库（FR-17 / R14）
+            "intent": "TEXT NOT NULL DEFAULT ''",
+            "intent_confidence": "REAL NOT NULL DEFAULT 0",
+            "intent_source": "TEXT NOT NULL DEFAULT ''",
+            "intent_slots": "TEXT NOT NULL DEFAULT '[]'",
+            "intent_latency_ms": "REAL NOT NULL DEFAULT 0",
         }
         for name, ddl in additions.items():
             if name not in existing:
@@ -157,7 +163,9 @@ class SessionStore:
             row = self._conn.execute(
                 "SELECT * FROM turns WHERE session_id = ? AND seq = ?", (session_id, seq)
             ).fetchone()
-        return None if row is None else _row_to_dict(row, ("asr_partials", "rag_hits", "timings"))
+        return None if row is None else _row_to_dict(
+            row, ("asr_partials", "rag_hits", "timings", "intent_slots")
+        )
 
     def delete_turn(self, session_id: str, seq: int) -> bool:
         """删除单轮：轮次记录与对应消息（FR-8.4 记忆管理）。"""
@@ -210,6 +218,11 @@ class SessionStore:
         tts_lang: str | None = None,
         tts_fallback: bool | None = None,
         spoken_ratio: float | None = None,
+        intent: str | None = None,
+        intent_confidence: float | None = None,
+        intent_source: str | None = None,
+        intent_slots: dict[str, Any] | None = None,
+        intent_latency_ms: float | None = None,
     ) -> None:
         fields: dict[str, Any] = {
             "assistant_text": assistant_text,
@@ -230,6 +243,16 @@ class SessionStore:
             fields["tts_lang"] = tts_lang
         if tts_fallback is not None:
             fields["tts_fallback"] = int(tts_fallback)
+        if intent is not None:
+            fields["intent"] = intent
+        if intent_confidence is not None:
+            fields["intent_confidence"] = float(intent_confidence)
+        if intent_source is not None:
+            fields["intent_source"] = intent_source
+        if intent_slots is not None:
+            fields["intent_slots"] = _dumps(intent_slots)
+        if intent_latency_ms is not None:
+            fields["intent_latency_ms"] = float(intent_latency_ms)
         assignments = ", ".join(f"{key} = ?" for key in fields)
         with self._lock, self._conn:
             self._conn.execute(
@@ -243,7 +266,8 @@ class SessionStore:
                 "SELECT * FROM turns WHERE session_id = ? ORDER BY seq ASC", (session_id,)
             ).fetchall()
         return [
-            _row_to_dict(row, ("asr_partials", "rag_hits", "timings")) for row in rows
+            _row_to_dict(row, ("asr_partials", "rag_hits", "timings", "intent_slots"))
+            for row in rows
         ]
 
     # ------------------------------------------------------------ 事件

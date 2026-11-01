@@ -18,6 +18,14 @@ from pydantic import BaseModel, Field, ValidationError
 
 from robotchat.api.auth import require_write
 from robotchat.config.loader import ConfigError, masked_settings
+from robotchat.observability.metrics import (
+    INTENT_CLASSIFY,
+    INTENT_FALLBACK,
+    INTENT_LATE_ROUTE,
+    INTENT_LOW_CONFIDENCE,
+    INTENT_RULE,
+    INTENT_TOTAL,
+)
 from robotchat.tools.base import ToolCall
 
 if TYPE_CHECKING:
@@ -50,6 +58,13 @@ class ToolInvokeRequest(BaseModel):
     """手动触发工具（调试用，T-5.4）。"""
 
     args: dict[str, Any] = Field(default_factory=dict)
+
+
+class IntentTestRequest(BaseModel):
+    """意图试跑请求（FR-17）：只收文本，不触发任何工具。"""
+
+    text: str
+    lang: str = ""
 
 
 class SessionCreateRequest(BaseModel):
@@ -343,6 +358,64 @@ async def update_barge_in(request: Request, body: BargeInUpdate) -> JSONResponse
             {"updated": False, "detail": f"非法打断参数：{exc}"}, status_code=400
         )
     return JSONResponse({"updated": True, **snapshot})
+
+
+# ---------------------------------------------------------------- 意图（FR-17 / R14）
+
+
+@router.get("/intents")
+async def get_intents(request: Request) -> dict[str, Any]:
+    """意图配置、驱动槽位与运行指标聚合（分布 / 低置信度 / 兜底 / 晚到 / 时延）。"""
+    runtime: AppRuntime = _runtime(request)
+    metrics = runtime.metrics
+    counters = metrics.counters()
+    distribution = {
+        name[len("intent_distribution:"):]: count
+        for name, count in counters.items()
+        if name.startswith("intent_distribution:")
+    }
+    total = counters.get(INTENT_TOTAL, 0)
+    low_confidence = counters.get(INTENT_LOW_CONFIDENCE, 0)
+    slot = runtime.registry.slot("intent")
+    dialogue = runtime.dialogue
+    return {
+        "config": runtime.settings.intent.model_dump(),
+        "router": (
+            dialogue.intent_router.snapshot()
+            if dialogue is not None and dialogue.intent_router is not None
+            else {"enabled": False}
+        ),
+        "slot": slot.snapshot() if slot is not None else None,
+        "metrics": {
+            "total": total,
+            "distribution": distribution,
+            "low_confidence": low_confidence,
+            "low_confidence_ratio": round(low_confidence / total, 4) if total else 0.0,
+            "fallback": counters.get(INTENT_FALLBACK, 0),
+            "late_route": counters.get(INTENT_LATE_ROUTE, 0),
+            "latency": {
+                stage: metrics.summary(stage).as_dict()
+                for stage in (INTENT_RULE, INTENT_CLASSIFY)
+            },
+        },
+    }
+
+
+@router.post("/intents/test", dependencies=[Depends(require_write)])
+async def test_intent(request: Request, body: IntentTestRequest) -> JSONResponse:
+    """意图试跑（FR-17.9）：先规则快速路径再语义分类，不写运行指标、不触发工具。"""
+    runtime: AppRuntime = _runtime(request)
+    dialogue = runtime.dialogue
+    router = dialogue.intent_router if dialogue is not None else None
+    if router is None or not router.enabled:
+        return JSONResponse({"tested": False, "detail": "意图识别未启用"}, status_code=503)
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"tested": False, "detail": "text 不能为空"}, status_code=400)
+    result = router.fast_path(text, body.lang)
+    if result is None:
+        result = await router.classify(text, body.lang, record_metrics=False)
+    return JSONResponse({"tested": True, "routed": router.route(result, False), **result.as_dict()})
 
 
 # ---------------------------------------------------------------- 会话（design §10.3）

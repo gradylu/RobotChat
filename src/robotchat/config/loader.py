@@ -18,7 +18,7 @@ ENV_PREFIX = "ROBOTCHAT__"
 SECRET_KEY_HINTS = ("api_key", "token", "secret", "password", "credential")
 _PLACEHOLDER = re.compile(r"^\${([A-Za-z_][A-Za-z0-9_]*)}$")
 
-BASE_FILES = ("app.yaml", "providers.yaml", "tools.yaml")
+BASE_FILES = ("app.yaml", "providers.yaml", "tools.yaml", "intent.yaml")
 
 
 class ConfigError(RuntimeError):
@@ -206,7 +206,7 @@ def masked_settings(settings: Settings) -> dict[str, Any]:
 
 ACTIVE_FILE = "config_active.yaml"
 PREVIOUS_FILE = "config_previous.yaml"
-HOT_SECTIONS: tuple[str, ...] = ("barge_in", "language", "providers", "tools")
+HOT_SECTIONS: tuple[str, ...] = ("barge_in", "language", "providers", "tools", "intent")
 RESTART_SECTIONS: tuple[str, ...] = (
     "app",
     "api",

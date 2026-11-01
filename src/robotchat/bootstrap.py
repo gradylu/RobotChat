@@ -10,4 +10,4 @@ from __future__ import annotations
 def load_drivers() -> None:
     """导入内置驱动模块，触发注册（幂等）。"""
     from robotchat.audio import file_io, ros2_bridge, ros2_native, vad  # noqa: F401
-    from robotchat.providers import asr, knowledge, kws, llm, tts  # noqa: F401
+    from robotchat.providers import asr, intent, knowledge, kws, llm, tts  # noqa: F401

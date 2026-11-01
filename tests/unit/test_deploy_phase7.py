@@ -48,19 +48,20 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
         yield test_client
 
 
-# ---------------------------------------------------------------- T-7.5 十八项自检
+# ---------------------------------------------------------------- T-7.5 十九项自检
 
 
-def test_selfcheck_has_eighteen_ordered_items(client: TestClient) -> None:
+def test_selfcheck_has_nineteen_ordered_items(client: TestClient) -> None:
     body = client.post("/api/diagnostics/selfcheck").json()
-    assert body["total"] == 18
-    assert [item["index"] for item in body["items"]] == list(range(1, 19))
+    assert body["total"] == 19
+    assert [item["index"] for item in body["items"]] == list(range(1, 20))
     keys = [item["key"] for item in body["items"]]
     assert keys[0] == "config"
     assert "device_profile" in keys
     assert "llm_kb" in keys
     assert "audio_aec" in keys
-    assert body["counts"]["PASS"] + body["counts"]["WARN"] + body["counts"]["FAIL"] == 18
+    assert "intent" in keys
+    assert body["counts"]["PASS"] + body["counts"]["WARN"] + body["counts"]["FAIL"] == 19
     for item in body["items"]:
         assert item["status"] in {"PASS", "WARN", "FAIL"}
         assert isinstance(item["hints"], list)

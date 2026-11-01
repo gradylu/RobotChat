@@ -1,0 +1,75 @@
+# 意图识别与路由配置（R14 / FR-17，design §7.3 / §9.6）。
+# 独立文件、支持热更新（HOT_SECTIONS）；意图集合全部来自此处，编排代码禁止硬编码（C-178）。
+# 环境变量覆盖：ROBOTCHAT__INTENT__*（如 ROBOTCHAT__INTENT__ENABLED=false）。
+intent:
+  enabled: true
+  # 低于该置信度一律按 chat 兜底（FR-17 / INV-11）
+  confidence_threshold: 0.6
+  # 语义分类与 LLM / RAG 并行的预算（毫秒）；超时按 chat 兜底，不阻塞首响（INV-10）
+  classify_timeout_ms: 200
+  # 灰区上限：threshold ~ gray_zone_top 之间留作 P2 澄清策略（当前仅透出）
+  gray_zone_top: 0.75
+  # 语义分类驱动；none = 仅规则快速路径（stop / confirm / cancel）
+  active: llm_intent
+  intents:
+    chat:
+      description: 闲聊、寒暄、开放式问答及其它无法归类的表达（兜底意图）
+      examples:
+        - 你好
+        - 今天天气真不错
+        - 给我讲个笑话
+        - 你叫什么名字
+    knowledge:
+      description: 需要检索知识库或文档才能回答的问题
+      examples:
+        - 机器人的保修政策是什么
+        - 说明书里怎么校准陀螺仪
+    command:
+      description: 让机器人立即执行某个工具动作的指令
+      examples:
+        - 帮我打开客厅的灯
+        - 前进一米
+        - 播放一首歌
+    confirm:
+      description: 对等待中的确认问题给予肯定答复
+      fast_path: true
+      examples:
+        - 确认
+        - 确定
+        - 执行
+        - 是的
+        - 好的
+        - 同意
+        - "yes"
+        - ok
+        - confirm
+    cancel:
+      description: 对等待中的确认问题给予否定答复
+      fast_path: true
+      examples:
+        - 取消
+        - 不要
+        - 不用
+        - 算了
+        - 否
+        - 不执行
+        - "no"
+        - cancel
+    stop:
+      description: 立即停止当前播报
+      fast_path: true
+      examples:
+        - 停
+        - 停止
+        - 别说了
+        - 闭嘴
+        - stop
+        - 停止播放
+  drivers:
+    llm_intent:
+      kind: llm
+      base_url: ${LLM_BASE_URL}
+      model: ${LLM_MODEL}
+      supports_slots: true
+      # 需要鉴权的端点取消注释（密钥只经环境变量注入，FR-10.10）：
+      # api_key_env: LLM_API_KEY

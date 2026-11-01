@@ -337,6 +337,98 @@ class ToolsSettings(BaseModel):
     max_rounds: int = Field(default=2, ge=1, le=5)
 
 
+# ---------------------------------------------------------------- 意图识别（R14 / FR-17）
+
+
+class IntentDef(BaseModel):
+    """单个意图定义：描述与示例注入语义分类提示词；fast_path 声明规则快速路径。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = ""
+    examples: list[str] = Field(default_factory=list)
+    fast_path: bool = False
+    # 可选补充规则：{"patterns": ["正则", ...]}，作用于去空白标点后的小写文本
+    rules: dict[str, Any] | None = None
+
+
+def _default_intents() -> dict[str, IntentDef]:
+    """默认 6 意图（design §9.6）；yaml 可整体覆盖。"""
+    return {
+        "chat": IntentDef(
+            description="闲聊、寒暄、开放式问答及其它无法归类的表达（兜底意图）",
+            examples=["你好", "今天天气真不错", "给我讲个笑话", "你叫什么名字"],
+        ),
+        "knowledge": IntentDef(
+            description="需要检索知识库或文档才能回答的问题",
+            examples=["机器人的保修政策是什么", "说明书里怎么校准陀螺仪"],
+        ),
+        "command": IntentDef(
+            description="让机器人立即执行某个工具动作的指令",
+            examples=["帮我打开客厅的灯", "前进一米", "播放一首歌"],
+        ),
+        "confirm": IntentDef(
+            description="对等待中的确认问题给予肯定答复",
+            examples=["确认", "确定", "执行", "是的", "好的", "同意", "yes", "ok", "confirm"],
+            fast_path=True,
+        ),
+        "cancel": IntentDef(
+            description="对等待中的确认问题给予否定答复",
+            examples=["取消", "不要", "不用", "算了", "否", "不执行", "no", "cancel"],
+            fast_path=True,
+        ),
+        "stop": IntentDef(
+            description="立即停止当前播报",
+            examples=["停", "停止", "别说了", "闭嘴", "stop", "停止播放"],
+            fast_path=True,
+        ),
+    }
+
+
+def _default_intent_drivers() -> dict[str, dict[str, Any]]:
+    return {"llm_intent": {}}
+
+
+class IntentSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    # 低于该置信度一律按 chat 兜底（FR-17 / INV-11）
+    confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    # 语义分类与 LLM / RAG 并行的预算；超时按 chat 兜底，不阻塞首响（INV-10）
+    classify_timeout_ms: int = Field(default=200, gt=0)
+    # 灰区上限：threshold ~ gray_zone_top 之间留作 P2 澄清策略（当前仅透出）
+    gray_zone_top: float = Field(default=0.75, ge=0.0, le=1.0)
+    # 语义分类驱动；none = 仅规则快速路径（stop / confirm / cancel）
+    active: str = "llm_intent"
+    intents: dict[str, IntentDef] = Field(default_factory=_default_intents)
+    drivers: dict[str, dict[str, Any]] = Field(default_factory=_default_intent_drivers)
+
+    @property
+    def intent_names(self) -> frozenset[str]:
+        return frozenset(self.intents)
+
+    @model_validator(mode="after")
+    def _check(self) -> IntentSettings:
+        if not self.intents:
+            raise ValueError("intent.intents 不能为空")
+        if "chat" not in self.intents:
+            raise ValueError(
+                "intent.intents 必须包含 chat（超时 / 低置信度 / 失败的兜底去向，FR-17）"
+            )
+        if self.enabled and self.active != "none" and self.active not in self.drivers:
+            raise ValueError(
+                f"intent.active={self.active!r} 未在 intent.drivers 中定义；"
+                f"可用驱动：{sorted(self.drivers)}"
+            )
+        if self.confidence_threshold >= self.gray_zone_top:
+            raise ValueError(
+                "intent.confidence_threshold 必须小于 intent.gray_zone_top"
+                f"（当前 {self.confidence_threshold} >= {self.gray_zone_top}）"
+            )
+        return self
+
+
 # ---------------------------------------------------------------- 根配置
 
 
@@ -355,6 +447,7 @@ class Settings(BaseModel):
     language: LanguageSettings = Field(default_factory=LanguageSettings)
     providers: ProvidersSettings
     tools: ToolsSettings = Field(default_factory=ToolsSettings)
+    intent: IntentSettings = Field(default_factory=IntentSettings)
 
     @model_validator(mode="after")
     def _check_open_ear(self) -> Settings:

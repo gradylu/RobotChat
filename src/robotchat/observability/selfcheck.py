@@ -20,7 +20,7 @@ from robotchat.observability.diagnostics import SelfCheckItem, check_wakeword
 if TYPE_CHECKING:
     from robotchat.runtime import AppRuntime
 
-SELFCHECK_TOTAL = 18
+SELFCHECK_TOTAL = 19
 
 _STATUS_MAP = {"ok": "PASS", "degraded": "WARN", "unavailable": "FAIL"}
 
@@ -448,8 +448,47 @@ def _check_aec(runtime: AppRuntime) -> SelfCheckItem:
     return _item(18, "audio_aec", "AEC 模式", status, detail, hints)
 
 
+def _check_intent(runtime: AppRuntime) -> SelfCheckItem:
+    """第 19 项：意图识别配置与驱动可用性（FR-17 / R14）。"""
+    intent = runtime.settings.intent
+    if not intent.enabled:
+        return _item(
+            19,
+            "intent",
+            "意图识别",
+            "WARN",
+            "已关闭（intent.enabled=false）",
+            ("如需 stop / confirm / cancel 快速路径与 command 直达工具，设置 intent.enabled=true",),
+        )
+    issues: list[str] = []
+    hints: list[str] = []
+    if "chat" not in intent.intents:
+        issues.append("意图集合缺少 chat")
+        hints.append("在 config/intent.yaml 中声明 chat 意图（兜底必需，C-178）")
+    if intent.active not in intent.drivers:
+        issues.append(f"active={intent.active!r} 未在 intent.drivers 中定义")
+    else:
+        cfg = intent.drivers.get(intent.active, {})
+        base_url = str(cfg.get("base_url", "") or "").strip()
+        if not base_url or "${" in base_url:
+            issues.append(f"驱动 {intent.active} 的 base_url 未配置")
+    if runtime.registry.slot("intent") is None:
+        issues.append("intent 槽位未注册")
+    if issues:
+        hints.append("语义分类不可用时该轮对话将按 chat 降级（规则快速路径不受影响）")
+        return _item(19, "intent", "意图识别", "WARN", "；".join(issues), tuple(hints))
+    return _item(
+        19,
+        "intent",
+        "意图识别",
+        "PASS",
+        f"已启用 {intent.active}，共 {len(intent.intents)} 个意图（fast_path "
+        f"{sum(1 for item in intent.intents.values() if item.fast_path)} 个）",
+    )
+
+
 async def run_selfcheck(runtime: AppRuntime) -> dict[str, Any]:
-    """执行 18 项启动自检，返回结构化结论（deployment §7.3）。"""
+    """执行 19 项启动自检，返回结构化结论（deployment §7.3）。"""
     config_files = sorted(runtime.config_dir.glob("*.yaml"))
     config_item = _item(
         1,
@@ -488,6 +527,7 @@ async def run_selfcheck(runtime: AppRuntime) -> dict[str, Any]:
         _check_device_profile(runtime),
         _check_llm_kb(runtime),
         _check_aec(runtime),
+        _check_intent(runtime),
     ]
 
     counts = {

@@ -95,6 +95,32 @@
 
 ---
 
+## Phase 1B — 意图识别与路由（R14 新增）
+
+> 编号沿用 requirements.md A12 的 `T-1B.*`。本阶段**不新增状态机状态与事件**：意图只作为 ASR final 之后的路由决策（design §9.6、ADR-18）。
+> 实施顺序：规则快速路径（T-1B.2）可先落地；语义分类依赖 Phase 2 的 LLM 驱动（T-2.3 / T-2.6），管线接入需 Phase 3 编排器就绪（T-3.6）。
+> `command` 的完整校验（白名单 / 参数 / 二次确认）与 `confirm` / `cancel` 窗口依赖 Phase 5 工具策略（T-5.5、T-5.10）：本阶段先交付规则、分类、路由与兜底，确认窗口的场景验收在 Phase 8 完成（C-182）。
+> 设计依据：design §9.6、§7.1、§7.3；需求 FR-17、NFR-1；验收 C-178 ~ C-186。
+>
+> **实施状态（2026-11-01）**：
+> - T-1B.1 ~ T-1B.6 **已完成**：`dialog/intent.py`（IntentRuleMatcher / IntentRouter / route 兜底）、`providers/intent/llm_intent.py`、`config/intent.yaml` + schema 校验与热更新、orchestrator 快速路径与并行分类接入（stop 复用 barge-in、command 首音频前经 gate 转工具、晚到记 `intent_late_route_count`）、metrics 六项指标、session 五字段落库。
+> - T-1B.7 **后端部分已完成**：`GET /api/intents`、`POST /api/intents/test`、`cli intent list` / `cli intent test`、自检第 19 项（intent）；**WebUI 面板（会话意图展示 / 配置页阈值 / 监控分布）随 Phase 6 交付**。
+> - T-1B.8（P2 灰区澄清）**暂缓**，按计划留待后续迭代。
+> - 单测 `tests/unit/test_intent.py`（11 例：快速路径 P95 ≤ 20ms / 不误判、route 窗口规则、低置信度与超时兜底、schema 拒非法配置、command 转工具与未知工具拒绝、晚到降级、落库读回、stop 语义打断）。
+
+| ID | 优先级 | 任务 | 产出物 | 验证 | 对应验收 | 依赖 |
+| --- | --- | --- | --- | --- | --- | --- |
+| T-1B.1 | P0 | 意图契约与配置外置：定义 `IntentRequest` / `IntentResult`（`intent` / `confidence` / `slots` / `source` / `latency_ms`）与 `IntentProvider` 抽象 + `IntentCapabilities`；落地 `config/intent.yaml`（意图集合与示例话术、`confidence_threshold` 默认 0.6、`classify_timeout_ms` 默认 200、`active` 驱动），纳入 schema 校验与热更新 | `providers/base.py`、`config/intent.yaml`、`config/schema.py` | 代码中无硬编码意图枚举；新增意图仅改配置；非法配置被拒 | C-178、C-185 | T-0.3、T-0.4 |
+| T-1B.2 | P0 | 规则快速路径：`stop` / `confirm` / `cancel` 的规则匹配（关键词 / 正则 + 语种），串行前置执行，判定 ≤ 20ms | `dialog/intent.py` | 单测：三类意图判定延迟 ≤ 20ms（P95）；非命中样本不误判 | C-181、C-182 | T-1B.1 |
+| T-1B.3 | P0 | 语义分类驱动 `llm_intent`：LLM 结构化输出（JSON schema 约束意图与槽位），与 LLM / RAG 请求并行发起；200ms 超时、失败 WARN + 指标、接入熔断降级 | `providers/intent/llm_intent.py` | 桩服务可返回意图与槽位；超时按 `chat` 兜底并计数；停服务后熔断且对话不中断 | C-179、C-184 | T-1B.1、T-2.3、T-2.6 |
+| T-1B.4 | P0 | 路由与兜底：低于阈值一律 `chat`；`command` 须高置信度产出工具名与参数并交工具白名单 / 参数校验 / 二次确认；`knowledge` 触发 RAG；`confirm` / `cancel` 仅 FR-9.10 确认窗口内生效、窗口外按 `chat`；`stop` 复用 Barge-in 取消路径 | `dialog/intent.py`、`core/orchestrator.py` | 单测覆盖全部路由分支；低置信度不触发工具；窗口外 `confirm` / `cancel` 按 `chat` | C-179、C-180、C-181、C-182 | T-1B.2、T-1B.3、T-5.10 |
+| T-1B.5 | P0 | 管线接入：ASR final → 意图识别与路由 → `chat` / `knowledge` / `command` 三分支，不新增状态与事件；`command` 须在首块音频入队前生效，晚到则按 `chat` 完成本轮并记 `intent_late_route_count` | `core/orchestrator.py` | e2e：三类意图各走对链路；晚到的 `command` 不追溯执行 | C-183、C-184 | T-1B.4、T-3.6 |
+| T-1B.6 | P0 | 意图可观测与落库：Turn 持久化 `intent` / `intent_confidence` / `intent_source` / `intent_slots` / `intent_latency_ms`；指标 `intent_distribution`、`intent_low_confidence_ratio`、`intent_fallback_count`、`intent_latency_ms`（按 `rule` / `classify` 路径）、`intent_late_route_count` | `dialog/session.py`、`observability/metrics.py` | 轮次接口可见意图字段；五项指标可查 | C-186 | T-1B.5、T-3.8、T-0.6 |
+| T-1B.7 | P0 | WebUI 与运维接入：WS `intent.detected`、会话面板展示意图 / 置信度 / 来源 / 槽位、模型配置页意图集合与阈值、监控页意图分布与低置信度占比、`GET /api/intents` 与 `POST /api/intents/test`、`cli intent list` / `cli intent test` | `api/`、`webui/`、`cli.py` | 界面与命令可用；改阈值热更新立即生效 | C-185、C-186 | T-1B.6、T-6.*、T-7.5 |
+| T-1B.8 | P2 | （FR-17.12）灰区澄清：置信度落在 `threshold` ~ `threshold + 0.15` 时先播报一句澄清并重试，最多一次 | `dialog/intent.py` | 灰区样本触发恰一次澄清；不出现连续追问 | C-180 | T-1B.4 |
+
+---
+
 ## Phase 3 — 状态机与会话编排（核心）
 
 | ID | 优先级 | 任务 | 产出物 | 验证 | 对应验收 | 依赖 |
@@ -196,7 +222,7 @@
 | T-7.2 | P0 | 完善 DDS 共存配置：`cyclonedds.xml`、Compose 环境变量、`/dev/shm`、`ipc: host` 全量核对 | `deploy/docker-compose.yml`、`cyclonedds.xml` | 容器与宿主机双向可见；换网 / 重启后仍可发现 | C-117、C-121、C-122 | T-0.8、B-09 |
 | T-7.3 | P0 | 资源限制与环境隔离：CPU / 内存上限、线程数限制（`OMP_NUM_THREADS`）、安全加固（`cap_drop` / `no-new-privileges` / 只读配置挂载）；**按 D13 实测输出本体资源预算表（应用 + ASR + TTS，不含 LLM）** | `docker-compose.yml`、资源预算表 | 资源被限制在上限内；本体其他业务不受影响；预算表与实际 `docker stats` 一致 | C-115、C-127、C-173 | T-7.1、B-10、B-11 |
 | T-7.4 | P0 | 一键部署脚本 `install.sh`：检测宿主机 `ROS_DISTRO` → 选择对应镜像标签 → 环境检查 → 生成 .env（含 `ROBOTCHAT_DEVICE_PROFILE`）→ 加载镜像 → 启动 → 等待就绪 → 自检 | `deploy/scripts/install.sh` | 干净环境单命令完成部署，5 分钟内就绪；发行版与机型 Profile 自动带入 | C-110、C-161、C-166 | T-7.1、T-7.2、T-7.3、T-1A.2 |
-| T-7.5 | P0 | 启动自检 `selfcheck.sh` 与 `cli doctor`：**18 项检查**（含机型 Profile、LLM / KB 连通、AEC 模式）+ PASS / WARN / FAIL 结论 + 可操作 hint | `deploy/scripts/selfcheck.sh`、`cli.py` | 自检输出结构化结论；故意制造故障（含 Profile 错误、LLM 不可达）能被检出 | C-123、C-168、C-171、C-174 | T-1.9、T-1A.6、T-2.6、T-2.11、T-7.4 |
+| T-7.5 | P0 | 启动自检 `selfcheck.sh` 与 `cli doctor`：**19 项检查**（含机型 Profile、LLM / KB 连通、AEC 模式、意图集合与分类驱动）+ PASS / WARN / FAIL 结论 + 可操作 hint | `deploy/scripts/selfcheck.sh`、`cli.py` | 自检输出结构化结论；故意制造故障（含 Profile 错误、LLM 不可达、意图配置非法）能被检出 | C-123、C-168、C-171、C-174、C-185 | T-1.9、T-1A.6、T-2.6、T-2.11、T-1B.1、T-7.4 |
 | T-7.6 | P0 | 健康 / 就绪 / 存活三级探测端点与 Compose healthcheck | `api/rest.py` | 就绪前 503，就绪后 200 且含子系统明细 | C-124 | T-6.2 |
 | T-7.7 | P0 | systemd 服务单元：开机自启、崩溃重启、与 Docker 依赖顺序 | `deploy/systemd/robotchat.service` | 重启机器人后自动启动并恢复就绪 | C-128 | T-7.4 |
 | T-7.8 | P0 | 数据持久化与卷管理：数据卷 / 日志卷 / 配置只读挂载；容器重建数据不丢 | `docker-compose.yml` | `down` 后 `up`，配置与历史会话数据仍在 | C-126 | T-5.1、T-7.4 |
@@ -216,13 +242,13 @@
 
 | ID | 优先级 | 任务 | 产出物 | 验证 | 对应验收 | 依赖 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T-8.1 | P0 | 单元测试：状态机全转移、取消传播、VAD、打断检测、陈旧事件丢弃、记忆裁剪、配置校验、唤醒调度与活跃窗口超时、语言路由与降级 | `tests/unit/` | 覆盖率达标，全部通过 | C-101、C-21 ~ C-25、C-144、C-154 | Phase 2A ~ 5 |
-| T-8.2 | P0 | 端到端测试：完整对话、打断、插话、工具调用、降级恢复（本地文件音频 + 桩服务，无需硬件），含中英 / 方言用例 | `tests/e2e/` | e2e 套件全绿 | C-102、C-150 ~ C-155 | T-6.1 |
+| T-8.1 | P0 | 单元测试：状态机全转移、取消传播、VAD、打断检测、陈旧事件丢弃、记忆裁剪、配置校验、唤醒调度与活跃窗口超时、语言路由与降级、意图规则快速路径与路由兜底 | `tests/unit/` | 覆盖率达标，全部通过 | C-101、C-21 ~ C-25、C-144、C-154、C-178 ~ C-182 | Phase 2A ~ 5 |
+| T-8.2 | P0 | 端到端测试：完整对话、打断、插话、工具调用、降级恢复（本地文件音频 + 桩服务，无需硬件），含中英 / 方言用例与意图三条链路（chat / knowledge / command）及低置信度兜底用例 | `tests/e2e/` | e2e 套件全绿 | C-102、C-150 ~ C-155、C-179 ~ C-184 | T-6.1 |
 | T-8.3 | P0 | 延迟基准测试与调优：测量各阶段延迟并迭代优化至目标值 | `tests/benchmark/` + 调优记录 | C-40 ~ C-43 全部达标 | C-40 ~ C-43 | T-8.2 |
 | T-8.4 | P0 | 稳定性与长稳测试：72h 运行、随机打断、故障注入（杀模型进程 / 断 ROS2 / 重启容器） | 测试脚本 + 报告 | C-26、C-28、C-125、C-133 达标 | C-26、C-28 | T-8.2 |
-| T-8.5 | P0 | 机器人本体联调：真实音频链路、打断、任务执行、容器化部署全流程验证；**必须覆盖 5 款目标机型（智元灵犀 X2 Pro 探索版 / X2 Ultra 旗舰版 / 智元 A2 / 智元 A3 / 宇树 G1），Humble 与 Jazzy 各至少一台** | 联调记录 | checklist 全部 P0 检查项通过（含 C-160 ~ C-166、C-177） | 全部 P0 | T-1A.7、T-7.4、T-8.4 |
+| T-8.5 | P0 | 机器人本体联调：真实音频链路、打断、任务执行、容器化部署全流程验证；**必须覆盖 5 款目标机型（智元灵犀 X2 Pro 探索版 / X2 Ultra 旗舰版 / 智元 A2 / 智元 A3 / 宇树 G1），Humble 与 Jazzy 各至少一台** | 联调记录 | checklist 全部 P0 检查项通过（含 C-160 ~ C-166、C-177、C-178 ~ C-185） | 全部 P0 | T-1A.7、T-1B.5、T-7.4、T-8.4 |
 | T-8.6 | P0 | 部署验收：双发行版镜像体积 / 无重依赖 / 无密钥 / ROS2 共存 / 资源限制 / 开机自启 / 机型 Profile 生效 / **AEC 模式与 LLM-KB 边界** | 验收报告 | C-110 ~ C-128、C-160 ~ C-166、C-169 ~ C-177 全部通过 | C-110 ~ C-128、C-160 ~ C-166、C-169 ~ C-177 | T-8.5 |
-| T-8.7 | P1 | 现场参数调优：在真实环境完成 barge-in / VAD / AEC 参数标定 | 标定记录 | 打断成功率与误打断率达到可接受水平 | C-03、C-07、C-08 | T-8.5 |
+| T-8.7 | P1 | 现场参数调优：在真实环境完成 barge-in / VAD / AEC 参数标定，并按 D15 完成意图阈值与示例话术标定 | 标定记录 | 打断成功率与误打断率达到可接受水平；意图分类准确率达标且低置信度不误触发控制 | C-03、C-07、C-08、C-179、C-180 | T-8.5、D15 |
 | T-8.8 | P1 | 机器人既有 ROS2 功能回归验证 | 回归报告 | 既有节点与功能无回归 | C-120 | T-8.5 |
 
 ---
@@ -244,6 +270,9 @@ M2.5 唤醒闭环可用
         ↓
 M2.6 多语言可用（中英 + 方言）
      Phase 2A（能力声明 + 语言路由 + 音色映射）
+        ↓
+M2.7 意图规则与分类可用
+     Phase 1B（规则快速路径 + 语义分类并行 + 低置信度兜底 chat；command 完整校验与确认窗口随 Phase 5 收敛）
         ↓
 M3 秒打断达标（核心验收里程碑）
      Phase 4（≤300ms）
@@ -277,6 +306,7 @@ M7 工业级稳定性与部署验收
 | B-04 | ~~本体算力（决定本地模型规模）~~ **已确认（A5）：本体跑 ASR / TTS / VAD / AEC / KWS，LLM / KB 在边端或云端** | T-2.11、T-7.3 | 已消解（实测余量见 B-11） |
 | B-11 | 首批 5 款机型（A11）本体算力逐机型实测（CPU / 内存余量 / GPU 或 NPU、语音模型同时驻留占用） | T-2.11、T-7.3 | Phase 2 |
 | B-12 | 边端 / 云端 LLM 与知识库契约（地址 / 模型 / 鉴权 / 检索接口） | T-2.11、T-2.12 | Phase 2 |
+| B-13 | **业务意图清单与示例话术、`intent.confidence_threshold` 现场标定**（A12 默认 6 类，业务侧可能需扩展或调整判定范围） | T-1B.2、T-1B.4、T-1B.7 | Phase 2 后（LLM 可调用时） |
 | B-10 | 机器人本体内存与磁盘余量 | T-7.3、T-2.8 | Phase 2 |
 | B-06 | ~~是否需要唤醒词~~ **已确认：需要唤醒词** | Phase 3A（T-3A.*） | 已消解（2026-09） |
 
